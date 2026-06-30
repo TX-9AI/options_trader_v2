@@ -120,9 +120,9 @@ class ButterflyStrategy(BaseOptionsStrategy):
         if regime.primary_regime not in (Regime.RANGING, Regime.COMPRESSION):
             return None
 
-        # ── Gate 4: VIX and Fed day ───────────────────────────────────────────
+        # ── Gate 4: VIX threshold (Fed days allowed — bot trades them) ──────────
         if not macro.butterfly_allowed:
-            logger.info(f"Butterfly blocked: VIX={macro.vix:.1f} or Fed day={macro.is_fed_day}")
+            logger.info(f"Butterfly blocked: VIX={macro.vix:.1f} above threshold")
             return None
 
         # ── Gate 5: GEX must be PINNING ───────────────────────────────────────

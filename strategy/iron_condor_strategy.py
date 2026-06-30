@@ -222,7 +222,8 @@ class IronCondorStrategy(BaseOptionsStrategy):
         if regime.primary_regime != Regime.RANGING:
             return None
 
-        if macro.vix >= VIX_BUTTERFLY_DISABLE or macro.is_fed_day:
+        if macro.vix >= VIX_BUTTERFLY_DISABLE:
+            logger.info(f"Condor blocked: VIX={macro.vix:.1f} above threshold")
             return None
 
         # Compute expected move
