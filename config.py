@@ -89,7 +89,7 @@ TIMEZONE                    = "US/Eastern"
 RTH_OPEN_ET                 = (9, 30)
 RTH_CLOSE_ET                = (16, 0)
 HARD_CLOSE_ET               = (15, 45)
-NO_ENTRY_AFTER_ET           = (14, 0)
+NO_ENTRY_AFTER_ET           = (11, 0)   # ORB entries only valid until 11:00 AM ET
 BUTTERFLY_ENTRY_CUTOFF_ET   = (15, 0)
 BUTTERFLY_ENTRY_START_ET    = (12, 0)   # No butterfly entries before noon
 ORB_WINDOW_MINUTES          = 5
@@ -137,7 +137,7 @@ CONDOR_PROXIMITY_STRIKES    = 2      # Strikes inside the short strike that trig
                                      # (2 strikes = 10pt on SPX, $2 on QQQ — scales naturally)
 CONDOR_STOP_LOSS_PCT        = 0.25   # Exit if spread value rises to 125% of credit received
 CONDOR_NICKEL_CLOSE         = 0.05   # Close leg when spread value decays to $0.05
-CONDOR_ENTRY_START_ET       = (10, 0)   # After ORB window
+CONDOR_ENTRY_START_ET       = (11, 0)   # No condor entries before 11 AM (after ORB window closes)
 CONDOR_ENTRY_CUTOFF_ET      = (14, 0)   # Standard entry cutoff
 
 # ─── EXIT MANAGEMENT ──────────────────────────────────────────────────────────
