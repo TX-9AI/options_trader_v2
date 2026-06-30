@@ -5,6 +5,13 @@ v1.1 — 2026-06-27 — strategy-aware exit routing:
         ORB:     stop on 1-min close back inside range, trail at 50% TP, no BOS
         Sweep:   BOS on 1-min structure, hard stop 25%
         Butterfly: time/premium exits only, no BOS, no trail
+v1.2 — 2026-06-30 — ORB no longer hard-exits at 100% TP. Past 100%, the trail
+        tightens to track the nearest unfilled 1-minute Fair Value Gap on the
+        underlying (in the trade\'s favor), giving the position room to wick
+        back and fill the gap without exiting on every dip, while still
+        protecting the bulk of gains if the move actually reverses. FVG
+        detection is scoped to 1m data only, matching ORB entry/exit logic
+        which is always evaluated on the 1-minute timeframe.
 
 Exit triggers by strategy:
 
@@ -12,8 +19,9 @@ Exit triggers by strategy:
     1. HARD CLOSE: 15:45 ET
     2. RANGE VIOLATION: 1-min candle closes back inside ORB range
        (close < orb_high for longs, close > orb_low for shorts)
-    3. TARGET HIT: 100% TP
-    4. TRAIL: activates at 50% TP, trails at 75% of current premium
+    3. TRAIL (below 100% TP): activates at 50% TP, trails at 75% of current premium
+    4. TRAIL (at/past 100% TP): tightens to track the nearest unfilled 1m FVG
+       in the trade\'s favor — no hard exit at target, position can keep running
 
   SWEEP REVERSAL
     1. HARD CLOSE: 15:45 ET
@@ -32,7 +40,7 @@ Exit triggers by strategy:
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 
 import pandas as pd
@@ -46,11 +54,16 @@ from database.trade_logger import TradeRecord, get_trade_logger
 from data.tasty_client import get_session, get_account, TastyClientError
 from config import (
     PAPER_TRADING, CONTRACT_MULTIPLIER,
-    BUTTERFLY_MAX_HOLD_MIN, TRAIL_LOCK_PCT
+    BUTTERFLY_MAX_HOLD_MIN, TRAIL_LOCK_PCT, FVG_MIN_SIZE_PCT
 )
 from utils.time_utils import is_hard_close_time, minutes_since, now_utc, fmt_et_short
 
 logger = logging.getLogger(__name__)
+
+# Past 100% TP, the trail locks in this fraction of current premium as a
+# floor — tighter than the pre-target trail (75%), protecting gains beyond
+# the original target. Used only when no usable 1m FVG is found.
+POST_TARGET_TRAIL_LOCK_PCT = 0.85
 
 
 @dataclass
@@ -62,12 +75,83 @@ class ExitDecision:
     current_pnl_usd:    float = 0.0
 
 
+@dataclass
+class _SimpleFVG:
+    """Minimal 1-minute FVG used only for the post-target ORB trail."""
+    top:       float
+    bottom:    float
+    direction: str   # "bullish" or "bearish"
+    index:     int
+
+
+def _find_1m_fvgs(df_1m: pd.DataFrame) -> List["_SimpleFVG"]:
+    """
+    Detect Fair Value Gaps on the 1-minute timeframe only.
+    Same 3-candle imbalance logic as structure_analyzer.py, scoped to 1m
+    since ORB entry/exit conditions are always evaluated on 1m.
+    Returns most-recent-first.
+    """
+    gaps: List[_SimpleFVG] = []
+    if df_1m is None or len(df_1m) < 3:
+        return gaps
+
+    for i in range(2, len(df_1m)):
+        # Bullish FVG: candle[i].low > candle[i-2].high
+        gap_bot = float(df_1m["high"].iloc[i - 2])
+        gap_top = float(df_1m["low"].iloc[i])
+        if gap_top > gap_bot:
+            size_pct = (gap_top - gap_bot) / gap_bot if gap_bot > 0 else 0
+            if size_pct >= FVG_MIN_SIZE_PCT:
+                gaps.append(_SimpleFVG(top=gap_top, bottom=gap_bot,
+                                        direction="bullish", index=i))
+
+        # Bearish FVG: candle[i].high < candle[i-2].low
+        gap_top2 = float(df_1m["low"].iloc[i - 2])
+        gap_bot2 = float(df_1m["high"].iloc[i])
+        if gap_bot2 < gap_top2:
+            size_pct = (gap_top2 - gap_bot2) / gap_top2 if gap_top2 > 0 else 0
+            if size_pct >= FVG_MIN_SIZE_PCT:
+                gaps.append(_SimpleFVG(top=gap_top2, bottom=gap_bot2,
+                                        direction="bearish", index=i))
+
+    return sorted(gaps, key=lambda g: g.index, reverse=True)
+
+
+def _nearest_unfilled_fvg_in_favor(df_1m: pd.DataFrame, current_price: float,
+                                    direction: str) -> Optional["_SimpleFVG"]:
+    """
+    Find the nearest unfilled 1m FVG below current price for a long
+    (bullish gap, price hasn\'t traded back down through it) or above
+    current price for a short (bearish gap, price hasn\'t traded back
+    up through it). This is the gap the trail should give the trade
+    room to wick back into without exiting.
+    """
+    gaps = _find_1m_fvgs(df_1m)
+    if not gaps:
+        return None
+
+    candidates = []
+    for g in gaps:
+        if direction == "long" and g.direction == "bullish" and g.top < current_price:
+            candidates.append(g)
+        elif direction == "short" and g.direction == "bearish" and g.bottom > current_price:
+            candidates.append(g)
+
+    if not candidates:
+        return None
+
+    if direction == "long":
+        return max(candidates, key=lambda g: g.top)
+    else:
+        return min(candidates, key=lambda g: g.bottom)
+
+
 class BOSTracker:
     """
     Tracks 1-minute Break of Structure for sweep reversal trades.
-    Long:  tracks highest closing high → protected HL = low of that candle
+    Long:  tracks highest closing high \u2192 protected HL = low of that candle
            BOS = 1m close below protected HL
-    Short: tracks lowest closing low → protected LH = high of that candle
+    Short: tracks lowest closing low \u2192 protected LH = high of that candle
            BOS = 1m close above protected LH
     """
     def __init__(self, direction: str, entry_price: float):
@@ -79,7 +163,7 @@ class BOSTracker:
     def update(self, df_1m: pd.DataFrame) -> bool:
         """
         Update structure tracking. Returns True if BOS triggered.
-        Uses iloc[-2] — the last fully closed candle.
+        Uses iloc[-2] \u2014 the last fully closed candle.
         """
         if df_1m is None or len(df_1m) < 3:
             return False
@@ -129,7 +213,8 @@ class ExitEngine:
         self.paper_trading  = paper_trading
         self._trail_stops:  dict = {}
         self._trail_active: dict = {}
-        self._bos_trackers: dict = {}   # trade_id → BOSTracker (sweep only)
+        self._bos_trackers: dict = {}   # trade_id \u2192 BOSTracker (sweep only)
+        self._post_target_trail: dict = {}   # trade_id \u2192 bool (ORB only)
         self._trade_logger  = get_trade_logger()
 
     def evaluate(self,
@@ -150,7 +235,7 @@ class ExitEngine:
             # SweepReversal and any other directional strategies
             return self._evaluate_sweep(record, current_premium, df_1m)
 
-    # ─── ORB Exit ─────────────────────────────────────────────────────────────
+    # \u2500\u2500\u2500 ORB Exit \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _evaluate_orb(self, record: TradeRecord,
                        current_premium: float,
@@ -158,8 +243,10 @@ class ExitEngine:
         """
         ORB exit logic:
         - Stop: 1-min candle closes back inside ORB range
-        - TP:   100% of premium
-        - Trail: activates at 50% TP
+        - TP:   100% of premium \u2014 past this, trail tightens to track the
+                nearest unfilled 1m FVG instead of hard-exiting
+        - Trail: activates at 50% TP, trails at 75% of current premium below
+                 100%; 85% of current premium (tighter) above 100%
         - No BOS
         """
         decision   = ExitDecision()
@@ -181,7 +268,7 @@ class ExitEngine:
             decision.exit_reason = "hard_close_15:45_ET"
             return decision
 
-        # 2. RANGE VIOLATION — 1-min candle closes back inside ORB range
+        # 2. RANGE VIOLATION \u2014 1-min candle closes back inside ORB range
         if df_1m is not None and len(df_1m) >= 2:
             orb_high = record.get("orb_range_high", 0.0)
             orb_low  = record.get("orb_range_low", 0.0)
@@ -195,7 +282,7 @@ class ExitEngine:
                     )
                     logger.info(
                         f"ORB STOP: {trade_id[:8]} 1m close={last_close:.2f} "
-                        f"< orb_high={orb_high:.2f} — breakout failed"
+                        f"< orb_high={orb_high:.2f} \u2014 breakout failed"
                     )
                     return decision
                 elif direction == "short" and last_close > orb_low:
@@ -206,17 +293,31 @@ class ExitEngine:
                     )
                     logger.info(
                         f"ORB STOP: {trade_id[:8]} 1m close={last_close:.2f} "
-                        f"> orb_low={orb_low:.2f} — breakout failed"
+                        f"> orb_low={orb_low:.2f} \u2014 breakout failed"
                     )
                     return decision
 
-        # 3. TARGET HIT
+        # 3. PAST 100% TP \u2014 switch to tightened FVG-aware trail, no hard exit
         if current_premium >= target:
-            decision.should_exit = True
-            decision.exit_reason = f"target_hit pnl={pnl_pct:.1%}"
+            if not self._post_target_trail.get(trade_id, False):
+                self._post_target_trail[trade_id] = True
+                logger.info(
+                    f"ORB TARGET REACHED (no hard exit): {trade_id[:8]} "
+                    f"pnl={pnl_pct:.1%} \u2014 switching to tightened FVG trail"
+                )
+
+            trail_stop = self._update_post_target_trail(
+                trade_id, current_premium, record, df_1m, direction
+            )
+            if trail_stop is not None:
+                if current_premium <= trail_stop:
+                    decision.should_exit = True
+                    decision.exit_reason = f"orb_fvg_trail_stop pnl={pnl_pct:.1%}"
+                    return decision
+                decision.new_trail_stop = trail_stop
             return decision
 
-        # 4. TRAIL — activates at 50% TP, locks gains
+        # 4. TRAIL \u2014 below 100% TP, activates at 50% TP, locks gains
         trail_stop = self._update_trail(
             trade_id, current_premium, entry_prem, trail_act,
             entry_prem * 0.75  # hard floor = 25% loss
@@ -230,7 +331,59 @@ class ExitEngine:
 
         return decision
 
-    # ─── Sweep Reversal Exit ──────────────────────────────────────────────────
+    def _update_post_target_trail(self, trade_id: str, current_premium: float,
+                                   record: TradeRecord,
+                                   df_1m: Optional[pd.DataFrame],
+                                   direction: str) -> Optional[float]:
+        """
+        Past 100% TP: trail tightens to track the nearest unfilled 1m FVG
+        in the trade\'s favor, converted to an equivalent premium floor.
+        Falls back to a tightened percentage trail (85% of current premium)
+        if no usable FVG is found in the 1m data.
+        """
+        underlying_entry  = record.get("underlying_entry", 0.0)
+        underlying_target = record.get("underlying_target", 0.0)
+        entry_prem        = record["entry_premium"]
+
+        fvg_floor_premium = None
+
+        if df_1m is not None and underlying_entry > 0 and underlying_target > 0:
+            current_underlying_move = abs(underlying_target - underlying_entry)
+            fvg = _nearest_unfilled_fvg_in_favor(
+                df_1m,
+                current_price=underlying_target,
+                direction=direction
+            )
+            if fvg is not None and current_underlying_move > 0:
+                premium_per_point = (current_premium - entry_prem) / current_underlying_move \
+                                    if current_underlying_move > 0 else 0
+                if direction == "long":
+                    underlying_floor = fvg.top
+                else:
+                    underlying_floor = fvg.bottom
+
+                underlying_distance_from_entry = abs(underlying_floor - underlying_entry)
+                fvg_floor_premium = entry_prem + (underlying_distance_from_entry * premium_per_point)
+
+        pct_trail = current_premium * POST_TARGET_TRAIL_LOCK_PCT
+
+        if fvg_floor_premium is not None:
+            new_trail = max(fvg_floor_premium, pct_trail)
+        else:
+            new_trail = pct_trail
+
+        current_trail = self._trail_stops.get(trade_id, entry_prem)
+        if new_trail > current_trail:
+            self._trail_stops[trade_id] = new_trail
+            logger.debug(
+                f"ORB post-target trail updated: {trade_id[:8]} "
+                f"trail=${self._trail_stops[trade_id]:.2f} "
+                f"(fvg_based={fvg_floor_premium is not None})"
+            )
+
+        return self._trail_stops.get(trade_id)
+
+    # \u2500\u2500\u2500 Sweep Reversal Exit \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _evaluate_sweep(self, record: TradeRecord,
                          current_premium: float,
@@ -273,8 +426,8 @@ class ExitEngine:
             decision.exit_reason = f"target_hit pnl={pnl_pct:.1%}"
             return decision
 
-        # 4. BOS EXIT — only once premium is positive (don't BOS out of a
-        #    healthy retest that hasn't moved yet)
+        # 4. BOS EXIT \u2014 only once premium is positive (don\'t BOS out of a
+        #    healthy retest that hasn\'t moved yet)
         if df_1m is not None and pnl_pct > 0:
             tracker = self._get_bos_tracker(trade_id, direction, entry_prem)
             if tracker.update(df_1m):
@@ -295,7 +448,7 @@ class ExitEngine:
 
         return decision
 
-    # ─── Butterfly Exit ───────────────────────────────────────────────────────
+    # \u2500\u2500\u2500 Butterfly Exit \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _evaluate_butterfly(self, record: TradeRecord,
                              current_premium: float) -> ExitDecision:
@@ -353,7 +506,7 @@ class ExitEngine:
 
         return decision
 
-    # ─── Shared Helpers ───────────────────────────────────────────────────────
+    # \u2500\u2500\u2500 Shared Helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _get_bos_tracker(self, trade_id: str,
                           direction: str,
@@ -469,6 +622,7 @@ class ExitEngine:
         self._trail_stops.pop(trade_id, None)
         self._trail_active.pop(trade_id, None)
         self._bos_trackers.pop(trade_id, None)
+        self._post_target_trail.pop(trade_id, None)
 
 
 # Singleton

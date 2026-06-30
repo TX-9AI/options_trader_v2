@@ -12,6 +12,7 @@ v1.2 — 2026-06-30 — stripped down to exactly 4 essential alerts:
 import logging
 from typing import Optional
 from utils.time_utils import fmt_et_short
+from config import INSTRUMENT
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +60,11 @@ class AlertManager:
     # ── 3. Trade entered ─────────────────────────────────────────────────────
 
     def send_entry_alert(self, record: dict):
-        mode = "PAPER" if record.get("paper_trade") else "LIVE"
+        mode   = "PAPER" if record.get("paper_trade") else "LIVE"
+        ticker = record.get("symbol", INSTRUMENT)
         if record.get("is_butterfly"):
             self._send(
-                f"\U0001F98B [{mode}] BUTTERFLY {record.get('option_side','').upper()} "
+                f"\U0001F98B [{mode}] {ticker} BUTTERFLY {record.get('option_side','').upper()} "
                 f"{record.get('center_strike','')} "
                 f"\u00b1{int((record.get('upper_strike',0) - record.get('center_strike',0)))} "
                 f"\u00d7{record.get('contracts',0)} "
@@ -72,7 +74,7 @@ class AlertManager:
             )
         else:
             self._send(
-                f"\U0001F4C8 [{mode}] {record.get('option_side','').upper()} "
+                f"\U0001F4C8 [{mode}] {ticker} {record.get('option_side','').upper()} "
                 f"{record.get('strike','')} "
                 f"\u00d7{record.get('contracts',0)} "
                 f"@ ${record.get('entry_premium',0):.2f} "
@@ -88,7 +90,7 @@ class AlertManager:
         sign = "+" if pnl_usd >= 0 else ""
         icon = "\u2705" if pnl_usd >= 0 else "\u274C"
         self._send(
-            f"{icon} CLOSED {setup_type[:20]} | "
+            f"{icon} {INSTRUMENT} CLOSED {setup_type[:20]} | "
             f"pnl={sign}${pnl_usd:.2f} | "
             f"{fmt_et_short()}"
         )
