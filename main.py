@@ -304,25 +304,12 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
         )
 
     # Priority 3: Butterfly (Ranging/Compression — requires GEX PINNING)
+    # Fed days allowed — bot reaction time is faster and more systematic
+    # than manual trading on a volatile FOMC day. Fed day boosts ORB
+    # conviction instead of blocking entries.
     if (signal is None and
             regime.primary_regime in (Regime.RANGING, Regime.COMPRESSION) and
-            macro.butterfly_allowed and
-            not macro.is_fed_day):
-        signal = _butterfly_strategy.generate_signal(
-            regime        = regime,
-            vol_state     = ctx["vol"],
-            liq_map       = ctx["liq_map"],
-            chain         = chain,
-            macro         = macro,
-            current_price = ctx["price"],
-            gex           = ctx.get("gex")
-        )
-
-    # Priority 3: Butterfly (Ranging/Compression — requires GEX PINNING)
-    if (signal is None and
-            regime.primary_regime in (Regime.RANGING, Regime.COMPRESSION) and
-            macro.butterfly_allowed and
-            not macro.is_fed_day):
+            macro.butterfly_allowed):
         signal = _butterfly_strategy.generate_signal(
             regime        = regime,
             vol_state     = ctx["vol"],
@@ -334,17 +321,10 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
         )
 
     # Priority 4: Iron Condor — legged entry, RANGING fallback when no GEX pin.
-    # Two modes per tick:
-    #   a) No active plan yet: call decide() to evaluate and identify both
-    #      vertical spread strike locations. No order placed — just planning.
-    #   b) Active plan (DECIDED or LEG1_FILLED): call check_leg_triggers()
-    #      to see if price has reached a leg's trigger level. If yes, returns
-    #      a signal for that leg. Regime-flip cancellation is also handled here.
     if not _iron_condor_strategy.has_active_plan:
         # Try to make a condor plan if no other signal fired and regime is RANGING
         if (signal is None and
-                regime.primary_regime == Regime.RANGING and
-                not macro.is_fed_day):
+                regime.primary_regime == Regime.RANGING):
             plan = _iron_condor_strategy.decide(
                 regime        = regime,
                 vol_state     = ctx["vol"],
@@ -605,6 +585,23 @@ def main_loop(state: BotState):
                     df_1m=ctx.get("df_1m"),
                     regime=regime.primary_regime if regime else None
                 )
+                # ── Condor Leg 2 check ────────────────────────────────────
+                # If Leg 1 is the open position and Leg 2 is still queued,
+                # check_leg_triggers() must run here — not in attempt_new_entry()
+                # which is blocked by has_open_position(). This is the only
+                # path that allows Leg 2 to fire while Leg 1 is already live.
+                # Once both legs are filled the condor is a complete 4-leg
+                # position and no further leg firing occurs.
+                if (_iron_condor_strategy.has_active_plan and
+                        _iron_condor_strategy.plan is not None and
+                        _iron_condor_strategy.plan.state == "LEG1_FILLED"):
+                    leg_signal = _iron_condor_strategy.check_leg_triggers(
+                        regime        = regime,
+                        chain         = ctx.get("chain"),
+                        current_price = ctx["price"]
+                    )
+                    if leg_signal is not None:
+                        _execute_condor_leg(leg_signal, state)
             else:
                 attempt_new_entry(ctx, regime, state)
 
