@@ -1,0 +1,38 @@
+# Secrets — never commit these
+credentials.py
+*.pem
+*.key
+*.env
+
+# Database and logs — generated at runtime
+trades.db
+bot.log
+*.log
+*.log.*
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.tar
+*.tar.gz
+*.ziptrades.db-shm
+trades.db-wal

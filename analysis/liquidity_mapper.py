@@ -1,0 +1,429 @@
+"""
+analysis/liquidity_mapper.py — Institutional liquidity mapping.
+Tracks equal highs/lows, stop clusters, liquidity sweeps, and
+imbalance fills. Core input for the sweep reversal strategy.
+
+v1.1 additions:
+- Previous Day High/Low (PDH/PDL) as named high-value liquidity pools
+- Previous Session High/Low (Asia, London, NY) as named pools
+- Named pools carry higher confluence weight in sweep reversal strategy
+"""
+
+import logging
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+import pandas as pd
+
+from config import (
+    EQUAL_HIGH_LOW_LOOKBACK, EQUAL_LEVEL_PCT,
+    SWEEP_REJECTION_CANDLES, IMBALANCE_MIN_SIZE_PCT
+)
+from utils.math_utils import within_pct
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LiquidityPool:
+    """A cluster of equal highs or lows (stop resting zone)."""
+    price:          float
+    kind:           str    = "high"     # "high" or "low"
+    touch_count:    int    = 0
+    timeframe:      str    = ""
+    swept:          bool   = False
+    swept_index:    int    = -1
+    rejection_confirmed: bool = False
+    # Named pools carry extra confluence weight
+    name:           str    = ""         # e.g. "PDH", "PDL", "Asia High", "London Low"
+    is_named:       bool   = False      # True for PDH/PDL/session levels
+
+
+@dataclass
+class LiquiditySweep:
+    """A confirmed liquidity sweep event."""
+    pool_price:     float
+    sweep_price:    float
+    kind:           str     # "high_sweep" or "low_sweep"
+    rejection_candles: int  = 0
+    rejection_pct:  float   = 0.0
+    confirmed:      bool    = False
+    bar_index:      int     = 0
+    timeframe:      str     = ""
+    # Was this sweep of a named level? (PDH/PDL/session)
+    swept_named_level: str  = ""        # Name of the level swept, if any
+
+
+@dataclass
+class LiquidityMap:
+    """Complete liquidity landscape."""
+    pools:          List[LiquidityPool]  = field(default_factory=list)
+    sweeps:         List[LiquiditySweep] = field(default_factory=list)
+    recent_sweep:   Optional[LiquiditySweep] = None
+    sweep_age_bars: int                  = 999
+
+    # Named key levels
+    prev_day_high:      Optional[float] = None
+    prev_day_low:       Optional[float] = None
+    asia_session_high:  Optional[float] = None
+    asia_session_low:   Optional[float] = None
+    london_session_high: Optional[float] = None
+    london_session_low:  Optional[float] = None
+    ny_session_high:    Optional[float] = None
+    ny_session_low:     Optional[float] = None
+
+    # Stop cluster levels
+    stop_clusters_above: List[float]    = field(default_factory=list)
+    stop_clusters_below: List[float]    = field(default_factory=list)
+
+    near_pool_above:     Optional[float] = None
+    near_pool_below:     Optional[float] = None
+    near_pool_pct:       float           = 0.05
+
+
+class LiquidityMapper:
+    """
+    Maps institutional liquidity levels and detects sweep events.
+    Includes Previous Day High/Low and session highs/lows as named pools.
+    Named pools provide extra confluence when swept.
+    """
+
+    # Session hours in UTC
+    ASIA_START    = 0    # 00:00 UTC
+    ASIA_END      = 8    # 08:00 UTC
+    LONDON_START  = 7    # 07:00 UTC (overlap with Asia close)
+    LONDON_END    = 16   # 16:00 UTC
+    NY_START      = 13   # 13:00 UTC
+    NY_END        = 22   # 22:00 UTC
+
+    def analyze(self, df_5m: pd.DataFrame, df_15m: pd.DataFrame,
+                current_price: float) -> LiquidityMap:
+        lmap = LiquidityMap()
+
+        primary = df_15m if (df_15m is not None and not df_15m.empty) else df_5m
+        if primary is None or primary.empty:
+            return lmap
+
+        # Standard equal high/low pools
+        self._find_pools(lmap, primary, "15m")
+        if df_5m is not None and not df_5m.empty:
+            self._find_pools(lmap, df_5m, "5m")
+
+        # Named key levels (PDH/PDL, session H/L)
+        if df_5m is not None and not df_5m.empty:
+            self._find_named_levels(lmap, df_5m)
+        elif primary is not None:
+            self._find_named_levels(lmap, primary)
+
+        # Sweep detection
+        self._detect_sweeps(lmap, primary, "15m")
+        if df_5m is not None and not df_5m.empty:
+            self._detect_sweeps(lmap, df_5m, "5m")
+
+        # Stop clusters
+        self._identify_stop_clusters(lmap, primary, current_price)
+
+        # Nearby pools
+        self._flag_nearby_pools(lmap, current_price)
+
+        # Most recent sweep
+        confirmed = [s for s in lmap.sweeps if s.confirmed]
+        if confirmed:
+            lmap.recent_sweep = max(confirmed, key=lambda s: s.bar_index)
+            lmap.sweep_age_bars = len(primary) - 1 - lmap.recent_sweep.bar_index
+
+        named_levels = [p.name for p in lmap.pools if p.is_named]
+        logger.debug(
+            f"Liquidity: pools={len(lmap.pools)} sweeps={len(lmap.sweeps)} "
+            f"named={named_levels} "
+            f"recent_sweep={'YES' if lmap.recent_sweep else 'NO'} "
+            f"age={lmap.sweep_age_bars}bars"
+        )
+        return lmap
+
+    def _find_named_levels(self, lmap: LiquidityMap, df: pd.DataFrame):
+        """
+        Extract Previous Day High/Low and session highs/lows from candle data.
+        These are the most important liquidity levels — institutions specifically
+        target these for stop hunts before reversing.
+        """
+        if df is None or len(df) < 50:
+            return
+
+        now_utc = datetime.now(timezone.utc)
+
+        # Build candle timestamp index if available
+        has_timestamps = hasattr(df.index, 'hour') or (
+            hasattr(df.index, 'dtype') and 'datetime' in str(df.index.dtype)
+        )
+
+        if has_timestamps:
+            self._find_named_levels_from_timestamps(lmap, df, now_utc)
+        else:
+            # Fallback: estimate from candle count (5m candles)
+            self._find_named_levels_from_candle_count(lmap, df)
+
+    def _find_named_levels_from_timestamps(self, lmap: LiquidityMap,
+                                            df: pd.DataFrame, now_utc: datetime):
+        """Extract named levels using actual timestamps."""
+        try:
+            idx = pd.DatetimeIndex(df.index)
+            if idx.tz is None:
+                idx = idx.tz_localize('UTC')
+            else:
+                idx = idx.tz_convert('UTC')
+
+            today = now_utc.date()
+            yesterday = today - timedelta(days=1)
+
+            # Previous day
+            prev_day_mask = idx.date == yesterday
+            if prev_day_mask.any():
+                prev_day_data = df[prev_day_mask]
+                pdh = float(prev_day_data["high"].max())
+                pdl = float(prev_day_data["low"].min())
+                lmap.prev_day_high = pdh
+                lmap.prev_day_low  = pdl
+                self._add_named_pool(lmap, pdh, "high", "PDH")
+                self._add_named_pool(lmap, pdl, "low", "PDL")
+
+            # Today's sessions
+            today_mask = idx.date == today
+
+            # Asia session (00:00-08:00 UTC)
+            asia_mask = today_mask & (idx.hour >= self.ASIA_START) & (idx.hour < self.ASIA_END)
+            if asia_mask.any():
+                asia_data = df[asia_mask]
+                ash = float(asia_data["high"].max())
+                asl = float(asia_data["low"].min())
+                lmap.asia_session_high = ash
+                lmap.asia_session_low  = asl
+                self._add_named_pool(lmap, ash, "high", "Asia High")
+                self._add_named_pool(lmap, asl, "low",  "Asia Low")
+
+            # London session (07:00-16:00 UTC)
+            london_mask = today_mask & (idx.hour >= self.LONDON_START) & (idx.hour < self.LONDON_END)
+            if london_mask.any():
+                london_data = df[london_mask]
+                lsh = float(london_data["high"].max())
+                lsl = float(london_data["low"].min())
+                lmap.london_session_high = lsh
+                lmap.london_session_low  = lsl
+                self._add_named_pool(lmap, lsh, "high", "London High")
+                self._add_named_pool(lmap, lsl, "low",  "London Low")
+
+            # NY session (13:00-22:00 UTC)
+            ny_mask = today_mask & (idx.hour >= self.NY_START) & (idx.hour < self.NY_END)
+            if ny_mask.any():
+                ny_data = df[ny_mask]
+                nyh = float(ny_data["high"].max())
+                nyl = float(ny_data["low"].min())
+                lmap.ny_session_high = nyh
+                lmap.ny_session_low  = nyl
+                self._add_named_pool(lmap, nyh, "high", "NY High")
+                self._add_named_pool(lmap, nyl, "low",  "NY Low")
+
+        except Exception as e:
+            logger.debug(f"Named level extraction failed: {e}")
+            self._find_named_levels_from_candle_count(lmap, df)
+
+    def _find_named_levels_from_candle_count(self, lmap: LiquidityMap, df: pd.DataFrame):
+        """
+        Fallback: estimate session levels from candle count.
+        5m candles: 288/day, 96/session (8hrs), 48/4hrs
+        """
+        n = len(df)
+        if n < 50:
+            return
+
+        # Previous day = candles 288-576 ago (rough)
+        prev_day_start = min(n, 576)
+        prev_day_end   = min(n, 288)
+        if prev_day_start > prev_day_end:
+            prev_day = df.iloc[n - prev_day_start : n - prev_day_end]
+            if len(prev_day) > 0:
+                pdh = float(prev_day["high"].max())
+                pdl = float(prev_day["low"].min())
+                lmap.prev_day_high = pdh
+                lmap.prev_day_low  = pdl
+                self._add_named_pool(lmap, pdh, "high", "PDH")
+                self._add_named_pool(lmap, pdl, "low",  "PDL")
+
+        # Asia session estimate = 96 candles ago (8hrs of 5m)
+        asia_candles = min(96, n // 3)
+        asia_data = df.iloc[n - asia_candles * 2 : n - asia_candles]
+        if len(asia_data) > 0:
+            ash = float(asia_data["high"].max())
+            asl = float(asia_data["low"].min())
+            lmap.asia_session_high = ash
+            lmap.asia_session_low  = asl
+            self._add_named_pool(lmap, ash, "high", "Asia High")
+            self._add_named_pool(lmap, asl, "low",  "Asia Low")
+
+    def _add_named_pool(self, lmap: LiquidityMap, price: float,
+                         kind: str, name: str):
+        """Add a named liquidity pool, avoiding duplicates."""
+        # Don't add if too close to existing named pool
+        for pool in lmap.pools:
+            if pool.is_named and within_pct(pool.price, price, 0.002):
+                return
+
+        lmap.pools.append(LiquidityPool(
+            price=price,
+            kind=kind,
+            touch_count=1,
+            timeframe="daily" if "PD" in name else "session",
+            name=name,
+            is_named=True
+        ))
+
+    def _find_pools(self, lmap: LiquidityMap, df: pd.DataFrame, tf: str):
+        """Find equal highs and equal lows."""
+        highs = df["high"].tolist()
+        lows  = df["low"].tolist()
+        n     = min(len(highs), EQUAL_HIGH_LOW_LOOKBACK)
+
+        used_h = [False] * n
+        for i in range(n - 1, 0, -1):
+            if used_h[i]:
+                continue
+            cluster = [highs[-(n) + i]]
+            for j in range(i - 1, max(i - 20, -1), -1):
+                if not used_h[j] and within_pct(highs[-(n)+i], highs[-(n)+j], EQUAL_LEVEL_PCT):
+                    cluster.append(highs[-(n)+j])
+                    used_h[j] = True
+            used_h[i] = True
+            if len(cluster) >= 2:
+                avg = sum(cluster) / len(cluster)
+                if not any(within_pct(p.price, avg, EQUAL_LEVEL_PCT)
+                           for p in lmap.pools if p.kind == "high"):
+                    lmap.pools.append(LiquidityPool(
+                        price=avg, kind="high",
+                        touch_count=len(cluster), timeframe=tf
+                    ))
+
+        used_l = [False] * n
+        for i in range(n - 1, 0, -1):
+            if used_l[i]:
+                continue
+            cluster = [lows[-(n) + i]]
+            for j in range(i - 1, max(i - 20, -1), -1):
+                if not used_l[j] and within_pct(lows[-(n)+i], lows[-(n)+j], EQUAL_LEVEL_PCT):
+                    cluster.append(lows[-(n)+j])
+                    used_l[j] = True
+            used_l[i] = True
+            if len(cluster) >= 2:
+                avg = sum(cluster) / len(cluster)
+                if not any(within_pct(p.price, avg, EQUAL_LEVEL_PCT)
+                           for p in lmap.pools if p.kind == "low"):
+                    lmap.pools.append(LiquidityPool(
+                        price=avg, kind="low",
+                        touch_count=len(cluster), timeframe=tf
+                    ))
+
+    def _detect_sweeps(self, lmap: LiquidityMap, df: pd.DataFrame, tf: str):
+        """Detect sweep events with named level tagging."""
+        if not lmap.pools:
+            return
+
+        highs  = df["high"].tolist()
+        lows   = df["low"].tolist()
+        closes = df["close"].tolist()
+        n      = len(highs)
+
+        for pool in lmap.pools:
+            for i in range(1, n):
+                if pool.kind == "high" and highs[i] > pool.price and not pool.swept:
+                    reject_close = closes[i]
+                    for k in range(1, min(SWEEP_REJECTION_CANDLES + 1, n - i)):
+                        reject_close = closes[i + k]
+                    rejection_pct = (highs[i] - reject_close) / highs[i]
+                    if rejection_pct >= 0.002:
+                        sweep = LiquiditySweep(
+                            pool_price=pool.price,
+                            sweep_price=highs[i],
+                            kind="high_sweep",
+                            rejection_candles=SWEEP_REJECTION_CANDLES,
+                            rejection_pct=rejection_pct,
+                            confirmed=True,
+                            bar_index=i,
+                            timeframe=tf,
+                            swept_named_level=pool.name if pool.is_named else ""
+                        )
+                        lmap.sweeps.append(sweep)
+                        pool.swept = True
+                        pool.swept_index = i
+                        pool.rejection_confirmed = True
+
+                elif pool.kind == "low" and lows[i] < pool.price and not pool.swept:
+                    reject_close = closes[i]
+                    for k in range(1, min(SWEEP_REJECTION_CANDLES + 1, n - i)):
+                        reject_close = closes[i + k]
+                    rejection_pct = (reject_close - lows[i]) / lows[i]
+                    if rejection_pct >= 0.002:
+                        sweep = LiquiditySweep(
+                            pool_price=pool.price,
+                            sweep_price=lows[i],
+                            kind="low_sweep",
+                            rejection_candles=SWEEP_REJECTION_CANDLES,
+                            rejection_pct=rejection_pct,
+                            confirmed=True,
+                            bar_index=i,
+                            timeframe=tf,
+                            swept_named_level=pool.name if pool.is_named else ""
+                        )
+                        lmap.sweeps.append(sweep)
+                        pool.swept = True
+                        pool.swept_index = i
+                        pool.rejection_confirmed = True
+
+    def _identify_stop_clusters(self, lmap: LiquidityMap,
+                                 df: pd.DataFrame, current_price: float):
+        if df is None or len(df) < 10:
+            return
+        recent = df.iloc[-30:] if len(df) >= 30 else df
+        highs_above = [float(h) * 1.001 for h in recent["high"].tolist()
+                       if float(h) > current_price]
+        lmap.stop_clusters_above = sorted(set([round(h, 0) for h in highs_above]))[:5]
+        lows_below = [float(l) * 0.999 for l in recent["low"].tolist()
+                      if float(l) < current_price]
+        lmap.stop_clusters_below = sorted(set([round(l, 0) for l in lows_below]),
+                                          reverse=True)[:5]
+
+    def _flag_nearby_pools(self, lmap: LiquidityMap, price: float):
+        buffer = price * lmap.near_pool_pct / 100
+        for pool in lmap.pools:
+            if pool.swept:
+                continue
+            if pool.kind == "high" and pool.price > price:
+                if pool.price - price < buffer:
+                    lmap.near_pool_above = pool.price
+            elif pool.kind == "low" and pool.price < price:
+                if price - pool.price < buffer:
+                    lmap.near_pool_below = pool.price
+
+    def is_near_pool(self, lmap: LiquidityMap, price: float,
+                     direction: str, buffer_pct: float = 0.003) -> bool:
+        for pool in lmap.pools:
+            if pool.swept:
+                continue
+            dist_pct = abs(pool.price - price) / price
+            if dist_pct <= buffer_pct:
+                if direction == "long" and pool.kind == "high" and pool.price > price:
+                    return True
+                if direction == "short" and pool.kind == "low" and pool.price < price:
+                    return True
+        return False
+
+    def recent_sweep_exists(self, lmap: LiquidityMap, max_bars: int = 10) -> bool:
+        return lmap.recent_sweep is not None and lmap.sweep_age_bars <= max_bars
+
+
+_liquidity_mapper: Optional[LiquidityMapper] = None
+
+
+def get_liquidity_mapper() -> LiquidityMapper:
+    global _liquidity_mapper
+    if _liquidity_mapper is None:
+        _liquidity_mapper = LiquidityMapper()
+    return _liquidity_mapper
