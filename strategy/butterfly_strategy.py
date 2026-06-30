@@ -126,7 +126,7 @@ class ButterflyStrategy(BaseOptionsStrategy):
             return None
 
         # ── Gate 5: GEX must be PINNING ───────────────────────────────────────
-        if gex is None or gex.environment != "PINNING":
+        if gex is None or gex.gex_environment != "PINNING":
             logger.info("Butterfly: GEX not PINNING — no edge without pin")
             return None
 

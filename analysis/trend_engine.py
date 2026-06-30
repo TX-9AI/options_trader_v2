@@ -1,6 +1,13 @@
 """
 analysis/trend_engine.py — Trend detection via EMA stacks, ADX, momentum.
 Operates on 5m, 15m, and 1H timeframes for multi-TF trend alignment.
+v1.0 — original release
+v1.1 — 2026-06-30 — primary_adx now sourced from the 5m timeframe instead
+        of 1H. This is a 0DTE intraday bot trading off ORB/butterfly setups
+        on 5-min structure — 1H ADX lags the actual session move and was
+        causing trend days to misclassify as RANGING (ADX stuck near 0
+        until the 1H candle had enough history to show directional
+        persistence, which can be hours after the actual breakout fired).
 """
 
 import logging
@@ -45,7 +52,7 @@ class TrendState:
     is_trending:       bool  = False
     is_bullish:        bool  = False
     is_bearish:        bool  = False
-    primary_adx:       float = 0.0    # ADX from the 1H TF (most reliable)
+    primary_adx:       float = 0.0    # ADX from the 5m TF — matches the bot's trading timeframe
 
 
 class TrendEngine:
@@ -152,7 +159,11 @@ class TrendEngine:
             state.votes[tf] = vote
             state.total_timeframes += 1
 
-            if tf == "1h":
+            # primary_adx drives the regime classifier's trending/ranging
+            # decision. For an intraday 0DTE bot this must reflect the
+            # timeframe the bot actually trades on (5m ORB/butterfly
+            # structure), not 1H which lags the live session by hours.
+            if tf == "5m":
                 primary_adx = vote.adx
 
             if vote.direction == "BULLISH":
@@ -194,7 +205,7 @@ class TrendEngine:
         logger.debug(
             f"Trend: {state.overall_direction} "
             f"conviction={state.overall_conviction:.2f} "
-            f"ADX={primary_adx:.1f} "
+            f"ADX(5m)={primary_adx:.1f} "
             f"aligned={state.aligned_timeframes}/{state.total_timeframes}"
         )
         return state

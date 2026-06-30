@@ -1,7 +1,12 @@
 """
-risk/setup_scorer.py — Scores and grades options trade signals A/B/C.
-Ported from crypto_trader with options-specific strategy profiles.
-Grade determines position size multiplier: A=1.5×, B=1.0×, C=0.5×.
+risk/setup_scorer.py — Scores and grades options trade signals A/B.
+v1.0 — original release — A/B/C grading
+v1.1 — 2026-06-30 — eliminated C grade entirely. There is no such thing
+        as a C-grade setup by definition — anything below the B threshold
+        is not a valid trade and returns None instead of a downsized
+        position. This prevents marginal/low-conviction setups from ever
+        firing in live trading regardless of available capital.
+        Grade determines position size multiplier: A=1.5x, B=1.0x.
 """
 
 import logging
@@ -22,9 +27,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SetupScore:
-    grade:           str   = "C"
+    grade:           str   = "B"
     score:           float = 0.0
-    size_multiplier: float = 0.5
+    size_multiplier: float = 1.0
     breakdown:       dict  = None
 
     def __post_init__(self):
@@ -85,6 +90,8 @@ STRATEGY_PROFILES = {
 class SetupScorer:
     """
     Scores an options signal using strategy-specific weights.
+    Returns A or B grade only — anything scoring below the B threshold
+    is not a valid trade and returns None.
     """
 
     def score(self,
@@ -93,7 +100,12 @@ class SetupScorer:
               vol_state: VolatilityState,
               structure: StructureMap,
               liq_map:   LiquidityMap,
-              macro:     Optional[MacroSnapshot] = None) -> SetupScore:
+              macro:     Optional[MacroSnapshot] = None) -> Optional[SetupScore]:
+        """
+        Returns SetupScore for A or B grade setups only.
+        Returns None if the setup scores below the B threshold —
+        there is no C grade. A below-threshold setup is not a trade.
+        """
 
         breakdown = {}
         name      = signal.strategy_name
@@ -165,7 +177,6 @@ class SetupScorer:
         breakdown["macro_context"] = round(macro_score, 3)
 
         # ── Weighted total ────────────────────────────────────────────────────
-        # Map each weight key to its corresponding breakdown value
         total = 0.0
         for dim, w in weights.items():
             val = breakdown.get(dim, 0.5)
@@ -176,13 +187,18 @@ class SetupScorer:
         if session == "late_session":
             total *= 0.85
 
-        # ── Grade ─────────────────────────────────────────────────────────────
+        # ── Grade — A or B only. No C grade exists. ─────────────────────────────
         if total >= grade_a:
             grade = "A"
         elif total >= grade_b:
             grade = "B"
         else:
-            grade = "C"
+            logger.info(
+                f"Setup REJECTED — below B threshold: score={total:.2f} "
+                f"(need >= {grade_b:.2f}) strategy={name} "
+                f"breakdown={breakdown}"
+            )
+            return None
 
         multiplier = GRADE_SIZE_MULTIPLIER[grade]
 

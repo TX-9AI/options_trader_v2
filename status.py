@@ -148,6 +148,9 @@ def get_regime_and_orb():
                 if len(parts) > 1:
                     strategy = parts[1].strip().split()[0].rstrip(")")
 
+            if "STRATEGY: NO TRADE" in line and strategy == "UNKNOWN":
+                strategy = "No Trade"
+
             if orb["high"] is None and "ORB range set:" in line:
                 try:
                     h = re.search(r"high=([\d.]+)", line)

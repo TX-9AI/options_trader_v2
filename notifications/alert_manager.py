@@ -2,6 +2,11 @@
 notifications/alert_manager.py — Telegram alerts for options_trader.
 v1.0 — original release (Twilio SMS)
 v1.1 — 2026-06-27 — replaced Twilio SMS with Telegram
+v1.2 — 2026-06-30 — stripped down to exactly 4 essential alerts:
+        bot started, bot stopped, trade entered, trade closed (win/loss).
+        Removed regime change spam and circuit breaker noise
+        (circuit breaker is implied by no further entry alerts —
+        operator can check status.py for the reason if curious).
 """
 
 import logging
@@ -30,72 +35,77 @@ class AlertManager:
                 logger.error(f"Telegram send failed: {e}")
         logger.info(f"ALERT: {msg}")
 
+    # ── 1. Bot started ──────────────────────────────────────────────────────
+
     def send_startup_alert(self, paper: bool, instrument: str,
                             risk_usd: float, session_limit: int):
         mode = "PAPER" if paper else "LIVE"
         self._send(
-            f"🚀 OptionsBot [{mode}] started | "
+            f"\U0001F680 OptionsBot [{mode}] STARTED | "
             f"{instrument} | "
-            f"risk=${risk_usd:.0f}/trade | "
-            f"CB={session_limit} losses | "
             f"{fmt_et_short()}"
         )
+
+    # ── 2. Bot stopped ──────────────────────────────────────────────────────
+
+    def send_shutdown_alert(self, instrument: str, reason: str = ""):
+        reason_str = f" | {reason}" if reason else ""
+        self._send(
+            f"\U0001F534 OptionsBot STOPPED | "
+            f"{instrument}{reason_str} | "
+            f"{fmt_et_short()}"
+        )
+
+    # ── 3. Trade entered ─────────────────────────────────────────────────────
 
     def send_entry_alert(self, record: dict):
         mode = "PAPER" if record.get("paper_trade") else "LIVE"
         if record.get("is_butterfly"):
             self._send(
-                f"🦋 [{mode}] BUTTERFLY {record.get('option_side','').upper()} "
+                f"\U0001F98B [{mode}] BUTTERFLY {record.get('option_side','').upper()} "
                 f"{record.get('center_strike','')} "
-                f"±{int((record.get('upper_strike',0) - record.get('center_strike',0)))} "
-                f"×{record.get('contracts',0)} "
+                f"\u00b1{int((record.get('upper_strike',0) - record.get('center_strike',0)))} "
+                f"\u00d7{record.get('contracts',0)} "
                 f"debit=${record.get('net_debit',0):.2f} "
                 f"total=${record.get('total_cost',0):.0f} | "
-                f"{record.get('strategy','')} | "
                 f"{fmt_et_short()}"
             )
         else:
             self._send(
-                f"📈 [{mode}] {record.get('option_side','').upper()} "
+                f"\U0001F4C8 [{mode}] {record.get('option_side','').upper()} "
                 f"{record.get('strike','')} "
-                f"×{record.get('contracts',0)} "
+                f"\u00d7{record.get('contracts',0)} "
                 f"@ ${record.get('entry_premium',0):.2f} "
                 f"total=${record.get('total_cost',0):.0f} | "
-                f"{record.get('strategy','')} "
-                f"grade={record.get('setup_grade','')} | "
                 f"{fmt_et_short()}"
             )
+
+    # ── 4. Trade closed — win/loss ───────────────────────────────────────────
 
     def send_exit_alert(self, trade_id: str, setup_type: str,
                          exit_premium: float, entry_premium: float,
                          pnl_usd: float, contracts: int, reason: str):
-        pnl_pct = (exit_premium - entry_premium) / entry_premium * 100 \
-                  if entry_premium > 0 else 0
-        sign    = "+" if pnl_usd >= 0 else ""
-        icon    = "✅" if pnl_usd >= 0 else "❌"
+        sign = "+" if pnl_usd >= 0 else ""
+        icon = "\u2705" if pnl_usd >= 0 else "\u274C"
         self._send(
             f"{icon} CLOSED {setup_type[:20]} | "
-            f"exit=${exit_premium:.2f} | "
-            f"pnl={sign}${pnl_usd:.2f} ({sign}{pnl_pct:.1f}%) | "
-            f"{reason[:30]} | "
+            f"pnl={sign}${pnl_usd:.2f} | "
             f"{fmt_et_short()}"
         )
 
+    # ── Suppressed — kept as no-ops so existing callers don't break ─────────
+
     def send_circuit_breaker_alert(self, session_losses: int, reason: str):
-        self._send(
-            f"🚨 CIRCUIT BREAKER: {session_losses} session losses | "
-            f"TRADING HALTED | "
-            f"{reason} | "
-            f"Restart: sudo systemctl start optionsbot | "
-            f"{fmt_et_short()}"
+        """Suppressed. Check status.py for circuit breaker state if curious."""
+        logger.info(
+            f"Circuit breaker fired (not sent to Telegram): "
+            f"{session_losses} losses — {reason}"
         )
 
     def send_regime_alert(self, old_regime: str, new_regime: str,
                            conviction: float, notes: str = ""):
-        self._send(
-            f"📊 REGIME: {old_regime} → {new_regime} "
-            f"({conviction:.0%}) | {notes[:40]} | {fmt_et_short()}"
-        )
+        """Suppressed. Regime changes are too frequent to be useful as alerts."""
+        pass
 
 
 _alert_manager: Optional[AlertManager] = None

@@ -137,8 +137,12 @@ class ORBEngine:
             logger.info("ORB: past 14:00 ET entry cutoff — state EXPIRED")
             return d
 
-        # Step 1: Set the ORB range (only once, at session start)
-        if d.state == ORBState.WAITING and is_orb_complete():
+        # Step 1: Set the ORB range — as soon as 5m data is available, not
+        # gated behind a live 9:35 ET wait. The 9:30-9:35 candle is always
+        # present in historical data (yfinance/TastyTrade), so a restart
+        # mid-day or a fresh install after 9:35 ET picks up the correct
+        # range on the very first update instead of sitting in WAITING.
+        if d.state == ORBState.WAITING:
             self._set_orb_range(df_5m)
 
         # Step 2: Watch for break while in RANGING
@@ -188,21 +192,46 @@ class ORBEngine:
         )
 
     def _get_orb_candle(self, df_5m: pd.DataFrame) -> Optional[pd.Series]:
-        """Return the 9:30 ET 5-min candle."""
+        """
+        Return the most recent 9:30 ET 5-min candle in the historical data.
+        This is today's candle if it's past 9:35 ET today, or the prior
+        trading day's candle (e.g. last Friday on a Monday pre-market
+        restart) if today's hasn't happened yet. Always returns the most
+        recent match, not the oldest, so the ORB range is correct on
+        every restart regardless of how much history is in df_5m.
+        """
         try:
             idx = df_5m.index
+            matches = []
             for i, ts in enumerate(idx):
                 ts_et = ts if hasattr(ts, 'hour') else ts.astimezone(ET)
                 if ts_et.hour == 9 and ts_et.minute == 30:
-                    return df_5m.iloc[i]
+                    matches.append(i)
+            if matches:
+                most_recent_idx = matches[-1]
+                return df_5m.iloc[most_recent_idx]
+
+            # Fallback: no exact 9:30 candle found — use the first candle
+            # of the most recent trading day present in the data
             today_et = now_et().date()
-            today_candles = [
+            same_day_candles = [
                 (i, ts) for i, ts in enumerate(idx)
                 if ts.date() == today_et
             ]
-            if today_candles:
-                first_idx = today_candles[0][0]
+            if same_day_candles:
+                first_idx = same_day_candles[0][0]
                 return df_5m.iloc[first_idx]
+
+            # Last resort: most recent trading day in the data, whatever it is
+            if len(idx) > 0:
+                last_date = idx[-1].date()
+                last_day_candles = [
+                    (i, ts) for i, ts in enumerate(idx)
+                    if ts.date() == last_date
+                ]
+                if last_day_candles:
+                    first_idx = last_day_candles[0][0]
+                    return df_5m.iloc[first_idx]
         except Exception as e:
             logger.debug(f"ORB candle lookup error: {e}")
         return None

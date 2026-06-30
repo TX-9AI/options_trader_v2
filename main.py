@@ -10,6 +10,7 @@ Run modes:
 
 import logging
 import logging.handlers
+import signal
 import sys
 import time
 import traceback
@@ -201,7 +202,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     # ── Strategy dispatch: regime → strategy ──────────────────────────────────
     # Priority 1: ORB (if confirmed AND regime is trending or breakout)
     orb = ctx["orb"]
-    if (orb.state in (ORBState.CONFIRMED_LONG, ORBState.CONFIRMED_SHORT) and
+    if (orb.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT) and
             regime.primary_regime in (
                 Regime.TRENDING_BULL, Regime.TRENDING_BEAR,
                 Regime.BREAKOUT_VOLATILE, Regime.RANGING, Regime.COMPRESSION
@@ -247,7 +248,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
         )
 
     if signal is None:
-        logger.debug(f"No signal for regime {regime.primary_regime}")
+        logger.info(f"STRATEGY: NO TRADE — regime={regime.primary_regime}")
         return
 
     if not signal.is_valid:
@@ -263,6 +264,12 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
         liq_map   = ctx["liq_map"],
         macro     = macro
     )
+
+    if score is None:
+        # Setup scored below the B threshold — there is no C grade.
+        # This is not a trade, regardless of available capital.
+        logger.info(f"STRATEGY: NO TRADE — {signal.strategy_name} setup below B threshold")
+        return
 
     sizing = risk_mgr.compute_size(
         premium           = signal.entry_premium,
@@ -529,6 +536,24 @@ def main():
         risk_usd   = session_config.risk_per_trade_usd,
         session_limit = SESSION_LOSS_LIMIT
     )
+
+    # ── Graceful shutdown alert on SIGTERM/SIGINT ────────────────────────────
+    # systemctl stop/restart sends SIGTERM. Without this handler the bot
+    # just dies silently with no Telegram notification.
+    def _handle_shutdown(signum, frame):
+        reason = "systemctl stop/restart" if signum == signal.SIGTERM else "manual interrupt"
+        logger.info(f"Shutdown signal received ({reason}) — sending alert and exiting")
+        try:
+            get_alert_manager().send_shutdown_alert(
+                instrument = session_config.instrument,
+                reason     = reason
+            )
+        except Exception as e:
+            logger.error(f"Failed to send shutdown alert: {e}")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT,  _handle_shutdown)
 
     # ── CRITICAL: Recover any open position immediately ─────────────────────
     # Runs before the main loop on every start, restart, or reboot.
