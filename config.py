@@ -123,6 +123,23 @@ BUTTERFLY_WING_QQQ          = 5      # $5 wings on QQQ/SPY
 # Computed at runtime in butterfly_strategy.py
 BUTTERFLY_GEX_PIN_PROXIMITY_MULT = 1.0  # Multiplier on expected move
 
+# ─── IRON CONDOR STRATEGY ─────────────────────────────────────────────────────
+# Fallback for RANGING regime when no GEX pin is available for a butterfly.
+# Delta-based strike selection is primary; expected-move guardrail is a
+# sanity check only, not a parallel sizing method.
+
+CONDOR_SHORT_DELTA          = 0.22   # Target delta for short strikes
+CONDOR_DELTA_TOLERANCE      = 0.05   # Acceptable deviation from target delta
+CONDOR_WING_WIDTH_SPX       = 25     # Fixed wing width in points on SPX
+CONDOR_WING_WIDTH_QQQ       = 5      # Fixed wing width in points on QQQ/SPY
+CONDOR_EXPECTED_MOVE_GUARDRAIL_MULT = 1.2  # Short strikes must be within this x EM
+CONDOR_PROXIMITY_STRIKES    = 2      # Strikes inside the short strike that trigger entry
+                                     # (2 strikes = 10pt on SPX, $2 on QQQ — scales naturally)
+CONDOR_STOP_LOSS_PCT        = 0.25   # Exit if spread value rises to 125% of credit received
+CONDOR_NICKEL_CLOSE         = 0.05   # Close leg when spread value decays to $0.05
+CONDOR_ENTRY_START_ET       = (10, 0)   # After ORB window
+CONDOR_ENTRY_CUTOFF_ET      = (14, 0)   # Standard entry cutoff
+
 # ─── EXIT MANAGEMENT ──────────────────────────────────────────────────────────
 
 TRAIL_ACTIVATION_PCT        = 0.50

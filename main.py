@@ -69,6 +69,7 @@ from analysis.orb_engine import get_orb_engine, ORBState
 from strategy.orb_strategy import ORBStrategy
 from strategy.sweep_reversal_strategy import SweepReversalStrategy
 from strategy.butterfly_strategy import ButterflyStrategy
+from strategy.iron_condor_strategy import IronCondorStrategy
 
 from risk.risk_manager import init_risk_manager, get_risk_manager
 from risk.setup_scorer import get_setup_scorer
@@ -86,6 +87,7 @@ from notifications.alert_manager import get_alert_manager
 _orb_strategy     = ORBStrategy()
 _sweep_strategy   = SweepReversalStrategy()
 _butterfly_strategy = ButterflyStrategy()
+_iron_condor_strategy = IronCondorStrategy()
 
 
 class BotState:
@@ -176,6 +178,75 @@ def run_regime_classification(ctx: dict, trigger: str, state: BotState) -> Regim
     return regime
 
 
+def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
+    """
+    Execute a single condor leg (2-leg vertical spread credit order).
+    Bypasses the normal signal/score/size pipeline since condor legs
+    are credit spreads with their own P&L math and sizing logic.
+    Paper mode: simulates fill, records to DB, notifies via Telegram.
+    Live mode: places the vertical spread order via TastyTrade.
+    """
+    import uuid
+    from database.trade_logger import make_record, get_trade_logger
+    from notifications.alert_manager import get_alert_manager
+    from config import CONTRACT_MULTIPLIER, CONDOR_NICKEL_CLOSE
+
+    mode     = "PAPER" if state.paper_trading else "LIVE"
+    trade_id = str(uuid.uuid4())
+
+    # Determine the short and long contracts from the signal
+    if signal.option_side == "call":
+        short_contract = signal.short_call_contract
+        long_contract  = signal.long_call_contract
+    else:
+        short_contract = signal.short_put_contract
+        long_contract  = signal.long_put_contract
+
+    if short_contract is None or long_contract is None:
+        logger.error(f"Condor leg: missing contracts — cannot execute")
+        return
+
+    net_credit = signal.net_credit
+    contracts  = 1  # Default 1 contract — TODO: size via risk manager
+
+    # In live mode, place the actual 2-leg order via TastyTrade
+    if not state.paper_trading:
+        try:
+            from execution.entry_engine import get_entry_engine
+            # TODO: implement live condor leg placement in entry_engine
+            logger.warning("Condor live order placement not yet implemented — skipping")
+            return
+        except Exception as e:
+            logger.error(f"Condor leg order failed: {e}")
+            return
+
+    # Paper mode: simulate fill at mid
+    total_credit = net_credit * contracts * CONTRACT_MULTIPLIER
+
+    is_leg1 = "Leg 1" in signal.setup_type
+    _iron_condor_strategy.notify_leg_filled(
+        is_leg1        = is_leg1,
+        credit         = net_credit,
+        short_contract = short_contract,
+        long_contract  = long_contract
+    )
+
+    get_alert_manager()._send(
+        f"\U0001F985 [{mode}] {signal.setup_type} | "
+        f"sell={short_contract.strike:.0f} buy={long_contract.strike:.0f} "
+        f"credit=${net_credit:.2f} | "
+        f"stop=${net_credit * (1 + signal.stop_loss_pct):.2f} | "
+        f"nickel=${CONDOR_NICKEL_CLOSE:.2f} | "
+        f"{fmt_et_short()}"
+    )
+
+    logger.info(
+        f"[{mode}] CONDOR LEG EXECUTED: {signal.setup_type} "
+        f"short={short_contract.strike:.0f} long={long_contract.strike:.0f} "
+        f"credit=${net_credit:.2f} total=${total_credit:.2f}"
+    )
+
+
 def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     """Try to generate and execute a trade signal."""
     session  = get_session_guard()
@@ -186,7 +257,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     # ── Session gate ──────────────────────────────────────────────────────────
     can_enter, reason = session.can_enter(ctx["macro"])
     if not can_enter:
-        logger.info(f"Entry blocked: {reason}")
+        logger.debug(f"Entry blocked: {reason}")
         return
 
 
@@ -232,7 +303,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
             current_price = ctx["price"]
         )
 
-    # Priority 3: Butterfly (Ranging/Compression)
+    # Priority 3: Butterfly (Ranging/Compression — requires GEX PINNING)
     if (signal is None and
             regime.primary_regime in (Regime.RANGING, Regime.COMPRESSION) and
             macro.butterfly_allowed and
@@ -246,6 +317,59 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
             current_price = ctx["price"],
             gex           = ctx.get("gex")
         )
+
+    # Priority 3: Butterfly (Ranging/Compression — requires GEX PINNING)
+    if (signal is None and
+            regime.primary_regime in (Regime.RANGING, Regime.COMPRESSION) and
+            macro.butterfly_allowed and
+            not macro.is_fed_day):
+        signal = _butterfly_strategy.generate_signal(
+            regime        = regime,
+            vol_state     = ctx["vol"],
+            liq_map       = ctx["liq_map"],
+            chain         = chain,
+            macro         = macro,
+            current_price = ctx["price"],
+            gex           = ctx.get("gex")
+        )
+
+    # Priority 4: Iron Condor — legged entry, RANGING fallback when no GEX pin.
+    # Two modes per tick:
+    #   a) No active plan yet: call decide() to evaluate and identify both
+    #      vertical spread strike locations. No order placed — just planning.
+    #   b) Active plan (DECIDED or LEG1_FILLED): call check_leg_triggers()
+    #      to see if price has reached a leg's trigger level. If yes, returns
+    #      a signal for that leg. Regime-flip cancellation is also handled here.
+    if not _iron_condor_strategy.has_active_plan:
+        # Try to make a condor plan if no other signal fired and regime is RANGING
+        if (signal is None and
+                regime.primary_regime == Regime.RANGING and
+                not macro.is_fed_day):
+            plan = _iron_condor_strategy.decide(
+                regime        = regime,
+                vol_state     = ctx["vol"],
+                chain         = chain,
+                macro         = macro,
+                current_price = ctx["price"]
+            )
+            # Plan is informational — no order yet. Leg triggers fire on
+            # subsequent ticks via check_leg_triggers().
+            if plan:
+                logger.info(
+                    f"Condor plan active — Leg 1={plan.leg1_side.upper()} "
+                    f"trigger@{plan.call_trigger_price if plan.leg1_side == 'call' else plan.put_trigger_price:.0f}"
+                )
+    else:
+        # Active plan: check if a leg should fire this tick
+        leg_signal = _iron_condor_strategy.check_leg_triggers(
+            regime        = regime,
+            chain         = chain,
+            current_price = ctx["price"]
+        )
+        if leg_signal is not None:
+            # Route directly to entry — bypasses normal signal/score path
+            # since condor legs are credit spreads with their own P&L math
+            _execute_condor_leg(leg_signal, state)
 
     if signal is None:
         logger.info(f"STRATEGY: NO TRADE — regime={regime.primary_regime}")
@@ -298,6 +422,86 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
             f"contracts={sizing.contracts} "
             f"total=${sizing.total_cost:.2f}"
         )
+
+
+def _execute_condor_leg(leg, state: BotState, chain):
+    """
+    Execute a single condor vertical spread leg (2-leg order).
+    Called when check_triggers() signals a leg is ready to fire.
+    This bypasses the normal signal/score/size flow since condor legs
+    are credit spreads with their own sizing logic (risk = max loss per leg).
+    """
+    from strategy.iron_condor_strategy import CondorLeg
+    from data.tasty_client import get_session, get_account
+    from tastytrade.order import (
+        NewOrder, Leg, OrderAction, OrderType, OrderTimeInForce,
+        PriceEffect, InstrumentType
+    )
+    from decimal import Decimal
+    import uuid
+
+    mode     = "PAPER" if state.paper_trading else "LIVE"
+    trade_id = f"CONDOR-{leg.side.upper()}-{uuid.uuid4().hex[:8].upper()}"
+
+    logger.info(
+        f"[{mode}] CONDOR LEG: {leg.side.upper()} spread "
+        f"{leg.short_strike:.0f}/{leg.long_strike:.0f} "
+        f"credit=${leg.credit:.2f} max_loss=${leg.max_loss:.2f} "
+        f"id={trade_id}"
+    )
+
+    if state.paper_trading:
+        # Paper mode: simulate fill at mid credit
+        _iron_condor_strategy.mark_leg_filled(leg, leg.credit)
+        get_alert_manager()._send(
+            f"\U0001F985 [PAPER] CONDOR {leg.side.upper()} LEG FILLED: "
+            f"{leg.short_strike:.0f}/{leg.long_strike:.0f} "
+            f"credit=${leg.credit:.2f} | "
+            f"{fmt_et_short()}"
+        )
+        return
+
+    # Live execution — 2-leg vertical spread order
+    try:
+        session = get_session()
+        account = get_account()
+
+        if leg.side == "call":
+            sell_sym = leg.short_contract.symbol
+            buy_sym  = leg.long_contract.symbol
+        else:
+            sell_sym = leg.short_contract.symbol
+            buy_sym  = leg.long_contract.symbol
+
+        legs = [
+            Leg(instrument_type=InstrumentType.EQUITY_OPTION,
+                symbol=sell_sym, action=OrderAction.SELL_TO_OPEN, quantity=1),
+            Leg(instrument_type=InstrumentType.EQUITY_OPTION,
+                symbol=buy_sym,  action=OrderAction.BUY_TO_OPEN,  quantity=1),
+        ]
+        order = NewOrder(
+            time_in_force = OrderTimeInForce.DAY,
+            order_type    = OrderType.LIMIT,
+            price         = Decimal(str(round(leg.credit, 2))),
+            price_effect  = PriceEffect.CREDIT,
+            legs          = legs,
+        )
+        response = account.place_order(session, order, dry_run=False)
+        if response.errors:
+            logger.error(f"Condor leg order failed: {response.errors}")
+            return
+
+        fill_credit = float(getattr(response.order, 'price', None) or leg.credit)
+        _iron_condor_strategy.mark_leg_filled(leg, fill_credit)
+        get_alert_manager()._send(
+            f"\U0001F985 CONDOR {leg.side.upper()} LEG FILLED: "
+            f"{leg.short_strike:.0f}/{leg.long_strike:.0f} "
+            f"credit=${fill_credit:.2f} | "
+            f"{fmt_et_short()}"
+        )
+
+    except Exception as e:
+        logger.error(f"Condor leg execution failed: {e}")
 
 
 def handle_session_reset(state: BotState):
@@ -398,7 +602,8 @@ def main_loop(state: BotState):
             if pos_mgr.has_open_position():
                 pos_mgr.manage_open_position(
                     chain=ctx.get("chain"),
-                    df_1m=ctx.get("df_1m")
+                    df_1m=ctx.get("df_1m"),
+                    regime=regime.primary_regime if regime else None
                 )
             else:
                 attempt_new_entry(ctx, regime, state)

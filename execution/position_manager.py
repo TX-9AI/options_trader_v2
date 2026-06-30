@@ -7,6 +7,8 @@ v1.2 — 2026-06-29 — use live chain marks in paper mode for accurate P&L disp
         butterfly mark computed from lower + upper - 2×center legs
 v1.3 — 2026-06-30 — notify ORB engine when an ORB trade closes so it re-arms
         and watches for the next breakout attempt this session
+v1.4 — 2026-06-30 — pass current regime to exit_engine.evaluate() so regime-flip
+        exits can fire for butterfly and condor leg positions
 """
 
 import logging
@@ -52,7 +54,8 @@ class PositionManager:
 
     def manage_open_position(self,
                               df_1m: Optional[pd.DataFrame] = None,
-                              chain=None) -> bool:
+                              chain=None,
+                              regime: Optional[str] = None) -> bool:
         if self._open_record is None:
             return False
 
@@ -69,7 +72,7 @@ class PositionManager:
         self._trade_logger.update_current_premium(trade_id, current_premium)
 
         exit_eng = get_exit_engine(self.paper_trading)
-        decision = exit_eng.evaluate(record, current_premium, df_1m=df_1m)
+        decision = exit_eng.evaluate(record, current_premium, df_1m=df_1m, regime=regime)
 
         if decision.new_trail_stop is not None:
             self._trade_logger.update_stop(trade_id, decision.new_trail_stop)

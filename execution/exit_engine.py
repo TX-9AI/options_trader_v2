@@ -220,15 +220,20 @@ class ExitEngine:
     def evaluate(self,
                  record: TradeRecord,
                  current_premium: float,
-                 df_1m: Optional[pd.DataFrame] = None) -> ExitDecision:
+                 df_1m: Optional[pd.DataFrame] = None,
+                 regime: Optional[str] = None) -> ExitDecision:
         """
         Strategy-aware exit evaluation.
         Routes to the appropriate exit logic based on strategy_name.
+        regime: current regime string — used for regime-flip exit checks on
+                neutral strategies (butterfly, condor) that depend on RANGING.
         """
         strategy = record.get("strategy", "")
 
         if record.get("is_butterfly"):
-            return self._evaluate_butterfly(record, current_premium)
+            return self._evaluate_butterfly(record, current_premium, regime=regime)
+        elif strategy == "IronCondorStrategy":
+            return self._evaluate_condor_leg(record, current_premium, regime=regime)
         elif strategy == "ORBStrategy":
             return self._evaluate_orb(record, current_premium, df_1m)
         else:
@@ -451,9 +456,11 @@ class ExitEngine:
     # \u2500\u2500\u2500 Butterfly Exit \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _evaluate_butterfly(self, record: TradeRecord,
-                             current_premium: float) -> ExitDecision:
+                             current_premium: float,
+                             regime: Optional[str] = None) -> ExitDecision:
         """
         Butterfly exit logic:
+        - Regime flip: exit immediately if regime flips to TRENDING
         - Max hold: 2.5 hours
         - Hard stop: net value <= 25% loss
         - Target: 25% of max profit
@@ -477,7 +484,20 @@ class ExitEngine:
             decision.exit_reason = "hard_close_15:45_ET"
             return decision
 
-        # 2. MAX HOLD
+        # 2. REGIME FLIP EXIT — butterfly assumption (neutral/ranging) is broken
+        # if the market transitions to a trending regime. Exit immediately rather
+        # than waiting for the stop to get hit by the same directional move.
+        TRENDING_REGIMES = {"TRENDING_BULL", "TRENDING_BEAR", "BREAKOUT_VOLATILE"}
+        if regime and regime in TRENDING_REGIMES:
+            decision.should_exit = True
+            decision.exit_reason = f"regime_flip_exit: {regime} incompatible with butterfly"
+            logger.info(
+                f"BUTTERFLY REGIME EXIT: {trade_id[:8]} — "
+                f"regime flipped to {regime}, exiting neutral position"
+            )
+            return decision
+
+        # 3. MAX HOLD
         if entry_time:
             try:
                 from datetime import timezone
