@@ -16,7 +16,7 @@ ADX is computed from the **5-minute timeframe**, matching the bot's actual tradi
 |--------|----------|
 | COMPRESSION | ButterflyStrategy (GEX pin-centered) |
 | SWEEP_REVERSAL | SweepReversal (OTM gamma play) |
-| TRENDING_BULL / TRENDING_BEAR | ORB debit spread |
+| TRENDING_BULL / TRENDING_BEAR | ORB long call/put |
 | RANGING | No new entries |
 
 ### Strategies
@@ -24,9 +24,13 @@ ADX is computed from the **5-minute timeframe**, matching the bot's actual tradi
 **ORB (Opening Range Breakout)**
 - 5-minute opening range locked at 9:30-9:35 ET
 - Range is fetched from historical candle data on every startup — not dependent on the bot being alive during the live 9:30 candle. A restart at noon, or a fresh install after 9:35 ET, immediately recovers the correct range instead of waiting for the next day.
+- High-conviction setup that typically forms at the start of the session, independent of whether the day later trends bull or bear — triggered strictly by the ORB break-and-retest rules, not by chasing a volatile breakout
 - States: `RANGING` -> `BREAK_HIGH/LOW_AWAITING_RETEST` -> `OPEN_LONG/SHORT`
 - Entry requires a genuine retest (wick into the range, body stays outside) — no chasing a breakout that never pulls back
 - A failed/invalidated break re-arms the engine to watch for the next attempt, up to three or more tries per session until the entry cutoff
+- Single-leg long call or long put (not a spread) — strike selected near the ORB-projected 100% target
+- TP set at 100% of the ORB width projected from the break level
+- No partial exits — once price reaches 50% of the target, a trailing stop arms and locks in profit as price continues toward 100%. The position exits all at once, either on the trail or the 100% target, never scaled out in pieces.
 - ORB entries valid until noon ET only
 
 **Sweep Reversal**
