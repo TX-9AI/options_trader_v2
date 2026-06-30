@@ -126,13 +126,15 @@ class StructureAnalyzer:
         # Nearest S/R to current price
         self._nearest_levels(smap, current_price)
 
+        res_str = f"{smap.nearest_resistance:.0f}" if smap.nearest_resistance is not None else "N/A"
+        sup_str = f"{smap.nearest_support:.0f}" if smap.nearest_support is not None else "N/A"
         logger.debug(
             f"Structure: {smap.structure_sequence} "
             f"SRlevels={len(smap.sr_levels)} "
             f"FVGs={len(smap.fvgs)} "
             f"OBs={len(smap.order_blocks)} "
-            f"res={smap.nearest_resistance:.0f} "
-            f"sup={smap.nearest_support:.0f}"
+            f"res={res_str} "
+            f"sup={sup_str}"
         )
         return smap
 
