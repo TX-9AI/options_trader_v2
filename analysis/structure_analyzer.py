@@ -2,6 +2,14 @@
 analysis/structure_analyzer.py — Market structure analysis.
 Swing highs/lows, S/R levels, Fair Value Gaps, order blocks,
 and HH/HL vs LH/LL sequence detection.
+v1.0 — original release
+v1.1 — 2026-06-30 — fix crash: nearest_resistance/nearest_support default
+        to None early in a session (before any S/R levels exist), but the
+        debug log line formatted them with :.0f unconditionally. This
+        raised TypeError on every single analyze() call until the first
+        S/R level formed, which silently broke run_analysis() upstream —
+        no ctx was ever built, so no strategy could ever fire and ORB
+        could never progress past WAITING.
 """
 
 import logging
