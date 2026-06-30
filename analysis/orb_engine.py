@@ -4,22 +4,26 @@ v1.0 — original release
 v1.1 — 2026-06-30 — full state model rewrite:
         RANGING -> BREAK_*_AWAITING_RETEST -> OPEN_LONG/SHORT -> closed -> RANGING
         INVALIDATED re-arms back to RANGING instead of ending the session.
-        Engine keeps watching for new breakout attempts until 14:00 ET cutoff
-        or until a position is open.
+v1.2 — 2026-06-30 — fix: ORB range was never being set if the bot started
+        or restarted after the 14:00 ET entry cutoff, because the cutoff
+        check ran BEFORE the range-setting step and immediately returned
+        EXPIRED. The range (high/low/width) should always be available
+        for display and reference even after the cutoff — only NEW
+        ENTRIES should be blocked past 14:00 ET, not the range itself.
+        Range is now set first (from historical data, regardless of time),
+        then the cutoff check determines entry eligibility separately.
 
 ORB rules (exact):
-  - Range defined by 9:30–9:35 ET candle (first 5-min candle) high and low
+  - Range defined by 9:30-9:35 ET candle (first 5-min candle) high and low
   - BREAK: 1-min candle CLOSE outside the ORB (not just a wick)
   - RETEST: a subsequent 1-min candle WICKS INTO the ORB but the BODY closes outside
   - CONFIRMED: break + retest both satisfied = valid ORB entry signal -> OPEN_LONG/SHORT
   - Stop: 1-min close beyond the BODY of the breakout candle (not the wick)
   - TP100: ORB width projected from the break level
   - TP50 (trail activation): 50% of TP100
-  - No entries after 14:00 ET
-  - No chasing: a breakout with no retest wick is NOT confirmed — discipline over FOMO
-  - Multiple attempts per session allowed: a failed/invalidated break re-arms the
-    engine to watch for the next attempt. The second or third attempt is often
-    the one that works after weak hands are shaken out on the first.
+  - No entries after 14:00 ET — but the range itself is always set/displayed
+  - No chasing: a breakout with no retest wick is NOT confirmed
+  - Multiple attempts per session allowed: a failed/invalidated break re-arms
 """
 
 import logging
@@ -38,14 +42,14 @@ logger = logging.getLogger(__name__)
 
 
 class ORBState:
-    WAITING                    = "WAITING"                     # Pre-9:35, building range
-    RANGING                    = "RANGING"                      # ORB defined, price inside range, watching for break
-    BREAK_HIGH_AWAITING_RETEST = "BREAK_HIGH_AWAITING_RETEST"   # Closed above ORB high — watching for retest
-    BREAK_LOW_AWAITING_RETEST  = "BREAK_LOW_AWAITING_RETEST"    # Closed below ORB low — watching for retest
-    INVALIDATED                = "INVALIDATED"                  # Break failed (closed back inside) — re-arms to RANGING
-    OPEN_LONG                  = "OPEN_LONG"                    # Retest confirmed — long position live
-    OPEN_SHORT                 = "OPEN_SHORT"                   # Retest confirmed — short position live
-    EXPIRED                    = "EXPIRED"                      # Past 14:00 ET — no more ORB entries
+    WAITING                    = "WAITING"
+    RANGING                    = "RANGING"
+    BREAK_HIGH_AWAITING_RETEST = "BREAK_HIGH_AWAITING_RETEST"
+    BREAK_LOW_AWAITING_RETEST  = "BREAK_LOW_AWAITING_RETEST"
+    INVALIDATED                = "INVALIDATED"
+    OPEN_LONG                  = "OPEN_LONG"
+    OPEN_SHORT                 = "OPEN_SHORT"
+    EXPIRED                    = "EXPIRED"
 
 
 @dataclass
@@ -55,28 +59,26 @@ class ORBData:
     orb_high:           float = 0.0
     orb_low:            float = 0.0
     orb_width:          float = 0.0
-    break_candle_high:  float = 0.0     # Body of the break candle (not wick)
+    break_candle_high:  float = 0.0
     break_candle_low:   float = 0.0
     break_candle_close: float = 0.0
-    break_direction:    str   = ""       # "long" or "short"
+    break_direction:    str   = ""
     bars_since_break:   int   = 0
     target_100pct:      float = 0.0
     target_50pct:       float = 0.0
-    stop_level:         float = 0.0     # 1m close beyond break candle body
-    target_strike:      int   = 0       # ORB-projected strike for option selection
+    stop_level:         float = 0.0
+    target_strike:      int   = 0
     confirmed_at:       str   = ""
-    attempt_number:     int   = 0       # How many break attempts this session
+    attempt_number:     int   = 0
+    entries_expired:    bool  = False
 
 
 class ORBEngine:
     """
     State machine that tracks the ORB through the session.
-    Call update() on every new 1-min and 5-min candle.
-    Returns ORBData with the current state.
-
-    Re-arm behavior: a failed break (INVALIDATED) or a closed position
-    resets the engine back to RANGING so it can watch for the next
-    breakout attempt, up to the 14:00 ET cutoff.
+    The range itself (high/low/width) is always set from historical data
+    as soon as it's available, regardless of time of day. Only NEW ENTRY
+    attempts are blocked past the 14:00 ET cutoff.
     """
 
     def __init__(self):
@@ -87,15 +89,10 @@ class ORBEngine:
         return self._data
 
     def reset_for_session(self):
-        """Call at start of each RTH session to clear yesterday's state."""
         self._data = ORBData()
         logger.info("ORB engine reset for new session")
 
     def _rearm(self):
-        """
-        Reset to RANGING while preserving the ORB high/low/width and
-        attempt counter. Called after INVALIDATED or after a position closes.
-        """
         d = self._data
         orb_high, orb_low, orb_width_val = d.orb_high, d.orb_low, d.orb_width
         attempt = d.attempt_number
@@ -109,68 +106,64 @@ class ORBEngine:
 
         logger.info(
             f"ORB re-armed for next attempt (#{attempt + 1}): "
-            f"watching range {orb_low:.2f}–{orb_high:.2f}"
+            f"watching range {orb_low:.2f}-{orb_high:.2f}"
         )
 
     def update(self, df_5m: pd.DataFrame, df_1m: pd.DataFrame,
                current_price: float) -> ORBData:
-        """
-        Process the latest candle data and advance the ORB state machine.
-
-        Args:
-            df_5m:          5-min candles (need the 9:30 candle for ORB range)
-            df_1m:          1-min candles (break and retest confirmation)
-            current_price:  Current underlying price
-
-        Returns:
-            Updated ORBData
-        """
         d = self._data
 
-        # Already in a live position or past cutoff with no position — nothing to do
-        if d.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT, ORBState.EXPIRED):
+        if d.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT):
             return d
 
-        # Past entry cutoff — expire (only if not currently in a confirmed position)
-        if is_past_entry_cutoff():
-            d.state = ORBState.EXPIRED
-            logger.info("ORB: past 14:00 ET entry cutoff — state EXPIRED")
-            return d
-
-        # Step 1: Set the ORB range — as soon as 5m data is available, not
-        # gated behind a live 9:35 ET wait. The 9:30-9:35 candle is always
-        # present in historical data (yfinance/TastyTrade), so a restart
-        # mid-day or a fresh install after 9:35 ET picks up the correct
-        # range on the very first update instead of sitting in WAITING.
-        if d.state == ORBState.WAITING:
+        # Step 1: Set the ORB range ALWAYS, regardless of cutoff status.
+        if d.orb_high == 0.0 and d.orb_low == 0.0:
             self._set_orb_range(df_5m)
 
-        # Step 2: Watch for break while in RANGING
-        if d.state == ORBState.RANGING:
+        # Step 2: Determine entry eligibility separately from range display
+        past_cutoff = is_past_entry_cutoff()
+        d.entries_expired = past_cutoff
+
+        if past_cutoff and d.state not in (
+            ORBState.BREAK_HIGH_AWAITING_RETEST, ORBState.BREAK_LOW_AWAITING_RETEST
+        ):
+            if d.state != ORBState.EXPIRED:
+                d.state = ORBState.EXPIRED
+                logger.info(
+                    f"ORB: past 14:00 ET entry cutoff — state EXPIRED "
+                    f"(range remains: {d.orb_low:.2f}-{d.orb_high:.2f})"
+                )
+            return d
+
+        # Step 3: Watch for break while in RANGING (only if not past cutoff)
+        if d.state == ORBState.RANGING and not past_cutoff:
             self._check_for_break(df_1m)
 
-        # Step 3: Watch for retest while awaiting confirmation
+        # Step 4: Watch for retest while awaiting confirmation
         if d.state in (ORBState.BREAK_HIGH_AWAITING_RETEST, ORBState.BREAK_LOW_AWAITING_RETEST):
             self._check_for_retest(df_1m)
 
-        # Step 4: Re-arm after invalidation so the engine watches for the next attempt
-        if d.state == ORBState.INVALIDATED:
+        # Step 5: Re-arm after invalidation
+        if d.state == ORBState.INVALIDATED and not past_cutoff:
             self._rearm()
+        elif d.state == ORBState.INVALIDATED and past_cutoff:
+            d.state = ORBState.EXPIRED
+            logger.info("ORB: invalidated past cutoff — state EXPIRED, no re-arm")
 
         return d
 
     def notify_position_closed(self):
-        """
-        Call this when an OPEN_LONG/OPEN_SHORT position closes (win or loss).
-        Re-arms the engine to watch for another attempt this session.
-        """
         d = self._data
         if d.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT):
-            logger.info(f"ORB position closed — re-arming for next attempt this session")
-            self._rearm()
+            if is_past_entry_cutoff():
+                d.state = ORBState.EXPIRED
+                logger.info("ORB position closed past cutoff — state EXPIRED, no re-arm")
+            else:
+                logger.info("ORB position closed — re-arming for next attempt this session")
+                self._rearm()
 
     def _set_orb_range(self, df_5m: pd.DataFrame):
-        """Extract the ORB high/low from the 9:30–9:35 ET candle."""
+        """Extract the ORB high/low from the most recent 9:30-9:35 ET candle."""
         d = self._data
         if df_5m is None or df_5m.empty:
             return
@@ -183,7 +176,9 @@ class ORBEngine:
         d.orb_high  = float(orb_candle["high"])
         d.orb_low   = float(orb_candle["low"])
         d.orb_width = d.orb_high - d.orb_low
-        d.state     = ORBState.RANGING
+
+        if d.state == ORBState.WAITING:
+            d.state = ORBState.RANGING
 
         logger.info(
             f"ORB range set: high={d.orb_high:.2f} "
@@ -192,14 +187,7 @@ class ORBEngine:
         )
 
     def _get_orb_candle(self, df_5m: pd.DataFrame) -> Optional[pd.Series]:
-        """
-        Return the most recent 9:30 ET 5-min candle in the historical data.
-        This is today's candle if it's past 9:35 ET today, or the prior
-        trading day's candle (e.g. last Friday on a Monday pre-market
-        restart) if today's hasn't happened yet. Always returns the most
-        recent match, not the oldest, so the ORB range is correct on
-        every restart regardless of how much history is in df_5m.
-        """
+        """Return the most recent 9:30 ET 5-min candle in the historical data."""
         try:
             idx = df_5m.index
             matches = []
@@ -211,8 +199,6 @@ class ORBEngine:
                 most_recent_idx = matches[-1]
                 return df_5m.iloc[most_recent_idx]
 
-            # Fallback: no exact 9:30 candle found — use the first candle
-            # of the most recent trading day present in the data
             today_et = now_et().date()
             same_day_candles = [
                 (i, ts) for i, ts in enumerate(idx)
@@ -222,7 +208,6 @@ class ORBEngine:
                 first_idx = same_day_candles[0][0]
                 return df_5m.iloc[first_idx]
 
-            # Last resort: most recent trading day in the data, whatever it is
             if len(idx) > 0:
                 last_date = idx[-1].date()
                 last_day_candles = [
@@ -237,10 +222,6 @@ class ORBEngine:
         return None
 
     def _check_for_break(self, df_1m: pd.DataFrame):
-        """
-        Detect a valid ORB break: 1-min candle CLOSE outside the ORB.
-        The break must be by at least ORB_BREAK_BUFFER to avoid noise.
-        """
         d = self._data
         if df_1m is None or len(df_1m) < 2:
             return
@@ -248,8 +229,6 @@ class ORBEngine:
         candle = df_1m.iloc[-2]
         close  = float(candle["close"])
         open_  = float(candle["open"])
-        high   = float(candle["high"])
-        low    = float(candle["low"])
 
         buffer = d.orb_high * ORB_BREAK_BUFFER / 100
 
@@ -296,18 +275,6 @@ class ORBEngine:
             )
 
     def _check_for_retest(self, df_1m: pd.DataFrame):
-        """
-        Detect the retest after a break.
-
-        RETEST condition (required — no chasing):
-          - A 1-min candle wicks INTO the ORB (wick crosses the ORB boundary)
-          - But the candle BODY closes OUTSIDE the ORB (confirmed continuation)
-
-        Invalidation:
-          - If a 1-min candle CLOSES back inside the ORB, the break is invalidated
-          - If max retest bars exceeded without retest, invalidate
-        Both invalidation paths re-arm the engine for the next attempt.
-        """
         d = self._data
         if df_1m is None or len(df_1m) < 2:
             return
@@ -340,7 +307,7 @@ class ORBEngine:
                 d.state        = ORBState.OPEN_LONG
                 d.confirmed_at = str(now_et())
                 logger.info(
-                    f"✅ ORB CONFIRMED LONG (attempt #{d.attempt_number}): "
+                    f"ORB CONFIRMED LONG (attempt #{d.attempt_number}): "
                     f"retest wick to {low:.2f} "
                     f"body_low={body_low:.2f} above ORB_HIGH={d.orb_high:.2f}"
                 )
@@ -352,7 +319,7 @@ class ORBEngine:
                     f"(orb_high={d.orb_high:.2f}) — re-arming for next attempt"
                 )
 
-        else:  # break_direction == "short"
+        else:
             wick_into_range = high > d.orb_low
             body_outside    = body_high <= d.orb_low * 1.001
             invalidated     = close > d.orb_low
@@ -361,7 +328,7 @@ class ORBEngine:
                 d.state        = ORBState.OPEN_SHORT
                 d.confirmed_at = str(now_et())
                 logger.info(
-                    f"✅ ORB CONFIRMED SHORT (attempt #{d.attempt_number}): "
+                    f"ORB CONFIRMED SHORT (attempt #{d.attempt_number}): "
                     f"retest wick to {high:.2f} "
                     f"body_high={body_high:.2f} below ORB_LOW={d.orb_low:.2f}"
                 )
@@ -374,10 +341,6 @@ class ORBEngine:
                 )
 
     def mark_triggered(self):
-        """
-        Legacy hook — kept for compatibility with any caller still using it.
-        Prefer notify_position_closed() which re-arms instead of ending the session.
-        """
         self.notify_position_closed()
 
     @property
@@ -394,7 +357,6 @@ class ORBEngine:
         return ""
 
 
-# Singleton — one ORB engine per session
 _orb_engine: Optional[ORBEngine] = None
 
 

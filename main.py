@@ -186,7 +186,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     # ── Session gate ──────────────────────────────────────────────────────────
     can_enter, reason = session.can_enter(ctx["macro"])
     if not can_enter:
-        logger.debug(f"Entry blocked: {reason}")
+        logger.info(f"Entry blocked: {reason}")
         return
 
 
