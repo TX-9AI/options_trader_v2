@@ -763,6 +763,23 @@ def main():
     # that position within seconds — not waiting for the first loop cycle.
     _recover_open_position(state)
 
+    # ── Pre-load ORB range from historical data ──────────────────────────────
+    # Runs at every startup regardless of time of day so status.py always
+    # shows the last known 9:30-9:35 ET range instead of "Waiting for 9:35".
+    # The range is fetched from yfinance historical 5m data — no live session
+    # required. Outside RTH this correctly shows as EXPIRED with real H/L/width.
+    try:
+        from data.data_cache import get_cache
+        _startup_data = get_cache().get_all()
+        _df5m = _startup_data.get("5m")
+        if _df5m is not None and not _df5m.empty:
+            get_orb_engine()._set_orb_range(_df5m)
+            logger.info("Startup: ORB range pre-loaded from historical data")
+        else:
+            logger.debug("Startup: no 5m data available for ORB pre-load")
+    except Exception as e:
+        logger.debug(f"Startup ORB pre-load skipped: {e}")
+
     logger.info(
         f"OptionsBot ready | "
         f"{'PAPER' if state.paper_trading else 'LIVE'} | "
