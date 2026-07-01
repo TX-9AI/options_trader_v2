@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 
 ET = ZoneInfo("US/Eastern")
-OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orb_range.json")
+OUTPUT_PATH = os.path.expanduser("~/options-trader/orb_range.json")
 
 
 def fetch_orb_range(symbol: str = "QQQ") -> dict:
