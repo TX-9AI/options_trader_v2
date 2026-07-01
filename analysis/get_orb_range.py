@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 
 ET = ZoneInfo("US/Eastern")
-OUTPUT_PATH = os.path.expanduser("~/options-trader/orb_range.json")
+OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orb_range.json")
 
 
 def fetch_orb_range(symbol: str = "QQQ") -> dict:
@@ -67,8 +67,26 @@ def fetch_orb_range(symbol: str = "QQQ") -> dict:
     }
 
 
+def get_instrument_from_env() -> str:
+    """Read OT_INSTRUMENT from systemd service environment if available."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["sudo", "systemctl", "show", "optionsbot", "--property=Environment"],
+            capture_output=True, text=True
+        )
+        import re
+        match = re.search(r'OT_INSTRUMENT=([^ ]+)', result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return os.environ.get("OT_INSTRUMENT", "QQQ")
+
+
 def main():
-    symbol = sys.argv[1] if len(sys.argv) > 1 else "QQQ"
+    # Command line arg takes priority, then systemd env, then default QQQ
+    symbol = sys.argv[1] if len(sys.argv) > 1 else get_instrument_from_env()
     try:
         result = fetch_orb_range(symbol)
         with open(OUTPUT_PATH, "w") as f:

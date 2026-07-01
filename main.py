@@ -510,19 +510,9 @@ def handle_session_reset(state: BotState):
         state.orb_reset_done     = False
 
     if not state.orb_reset_done:
-        # Fetch today's fresh ORB range before resetting engine state
-        try:
-            import subprocess as _sp
-            _r = _sp.run(
-                [sys.executable, os.path.join(os.path.dirname(LOG_FILE), "analysis", "get_orb_range.py"), INSTRUMENT],
-                capture_output=True, text=True, timeout=30
-            )
-            if _r.returncode == 0:
-                logger.info(f"RTH open: {_r.stdout.strip()}")
-            else:
-                logger.warning(f"RTH ORB fetch failed: {_r.stderr.strip()}")
-        except Exception as _e:
-            logger.warning(f"RTH ORB fetch skipped: {_e}")
+        # Fetch today's fresh 9:30 candle at RTH open — this is the second
+        # and final time get_orb_range.py runs each day (first was at startup).
+        _fetch_orb_range(INSTRUMENT)
         get_orb_engine().reset_for_session()
         state.orb_reset_done = True
         logger.info("ORB engine reset for new session")
@@ -727,6 +717,23 @@ def _recover_open_position(state: BotState):
 
 
 
+def _fetch_orb_range(instrument: str):
+    """Fetch and write orb_range.json. Called at startup and at RTH open."""
+    try:
+        import subprocess as _sp
+        _orb_script = os.path.join(INSTALL_DIR, "analysis", "get_orb_range.py")
+        _result = _sp.run(
+            [sys.executable, _orb_script, instrument],
+            capture_output=True, text=True, timeout=30
+        )
+        if _result.returncode == 0:
+            logger.info(f"ORB range: {_result.stdout.splitlines()[0]}")
+        else:
+            logger.warning(f"ORB range fetch failed: {_result.stderr.strip()}")
+    except Exception as e:
+        logger.warning(f"ORB range fetch skipped: {e}")
+
+
 def main():
     service_mode = "--service" in sys.argv
 
@@ -792,6 +799,12 @@ def main():
     # If the bot went down with money on the line, we resume managing
     # that position within seconds — not waiting for the first loop cycle.
     _recover_open_position(state)
+
+    # ── Fetch ORB range on every start/restart ───────────────────────────────
+    # Populates orb_range.json immediately so status.py and orb_engine.py
+    # have the correct range from the first tick. Also runs at RTH open
+    # inside handle_session_reset() to get today's fresh candle.
+    _fetch_orb_range(INSTRUMENT)
 
     # ── Fetch ORB range via get_orb_range.py ────────────────────────────────
     # Single source of truth: analysis/get_orb_range.py fetches the most
