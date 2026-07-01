@@ -722,13 +722,13 @@ def _recover_open_position(state: BotState):
 
 
 
-INSTALL_DIR = os.path.expanduser("~/options-trader")
 def _fetch_orb_range(instrument: str = ""):
     """Fetch and write orb_range.json. Called at startup and at RTH open."""
     try:
         import subprocess as _sp
         _symbol = os.environ.get("OT_INSTRUMENT", instrument or "QQQ")
-        _orb_script = os.path.join(INSTALL_DIR, "analysis", "get_orb_range.py")
+        _install_dir = os.path.expanduser("~/options-trader")
+        _orb_script = os.path.join(_install_dir, "analysis", "get_orb_range.py")
         _result = _sp.run(
             [sys.executable, _orb_script, _symbol],
             capture_output=True, text=True, timeout=30
