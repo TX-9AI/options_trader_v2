@@ -275,6 +275,15 @@ def main():
         print(f"  \u23F1  ORB High:    {orb['high']:.2f}")
         print(f"      ORB Low:     {orb['low']:.2f}")
         print(f"      ORB Width:   {orb['width']:.2f}")
+        # If state is still UNKNOWN (e.g. fresh install, empty log) but we
+        # have the range, check the current time to infer the correct state
+        if orb["state"] in ("UNKNOWN", "RANGING"):
+            now = datetime.now(ET)
+            hm = (now.hour, now.minute)
+            if not (9 <= now.hour < 16):
+                orb["state"] = "EXPIRED"
+            elif hm >= (14, 0):
+                orb["state"] = "EXPIRED"
         state_label = ORB_STATE_LABELS.get(orb["state"], orb["state"])
         attempt_str = f"  (attempt #{orb['attempt']})" if orb["attempt"] > 0 else ""
         print(f"      State:       {state_label}{attempt_str}")
