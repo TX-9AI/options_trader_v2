@@ -774,6 +774,11 @@ def main():
         _df5m = _startup_data.get("5m")
         if _df5m is not None and not _df5m.empty:
             get_orb_engine()._set_orb_range(_df5m)
+            # If we're past the entry cutoff or outside RTH, mark EXPIRED
+            # so status.py shows the correct state while preserving H/L/width
+            from utils.time_utils import is_past_entry_cutoff, is_rth
+            if is_past_entry_cutoff() or not is_rth():
+                get_orb_engine().data.state = "EXPIRED"
             logger.info("Startup: ORB range pre-loaded from historical data")
         else:
             logger.debug("Startup: no 5m data available for ORB pre-load")
