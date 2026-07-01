@@ -1,5 +1,9 @@
 """
-main.py — options_trader v1.0
+main.py — options_trader v2.2
+v1.0 — original release
+v2.2 — 2026-07-01 — iron condor legged entry, BB-anchored strikes,
+        regime-flip exits, ORB range via get_orb_range.py/orb_range.json,
+        fed day trading enabled, ORB cutoff 11AM, condor window 11AM-2PM
 0DTE options bot: ORB, Sweep Reversal, Butterfly
 RTH only (9:30–16:00 ET), hard close 15:45 ET.
 
@@ -10,6 +14,7 @@ Run modes:
 
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 import time
@@ -512,7 +517,7 @@ def handle_session_reset(state: BotState):
     if not state.orb_reset_done:
         # Fetch today's fresh 9:30 candle at RTH open — this is the second
         # and final time get_orb_range.py runs each day (first was at startup).
-        _fetch_orb_range(INSTRUMENT)
+        _fetch_orb_range(os.environ.get("OT_INSTRUMENT", INSTRUMENT))
         get_orb_engine().reset_for_session()
         state.orb_reset_done = True
         logger.info("ORB engine reset for new session")
@@ -717,13 +722,15 @@ def _recover_open_position(state: BotState):
 
 
 
-def _fetch_orb_range(instrument: str):
+INSTALL_DIR = os.path.expanduser("~/options-trader")
+def _fetch_orb_range(instrument: str = ""):
     """Fetch and write orb_range.json. Called at startup and at RTH open."""
     try:
         import subprocess as _sp
+        _symbol = os.environ.get("OT_INSTRUMENT", instrument or "QQQ")
         _orb_script = os.path.join(INSTALL_DIR, "analysis", "get_orb_range.py")
         _result = _sp.run(
-            [sys.executable, _orb_script, instrument],
+            [sys.executable, _orb_script, _symbol],
             capture_output=True, text=True, timeout=30
         )
         if _result.returncode == 0:
@@ -804,25 +811,7 @@ def main():
     # Populates orb_range.json immediately so status.py and orb_engine.py
     # have the correct range from the first tick. Also runs at RTH open
     # inside handle_session_reset() to get today's fresh candle.
-    _fetch_orb_range(INSTRUMENT)
-
-    # ── Fetch ORB range via get_orb_range.py ────────────────────────────────
-    # Single source of truth: analysis/get_orb_range.py fetches the most
-    # recent 9:30-9:35 ET candle and writes orb_range.json. Both
-    # orb_engine.py and status.py read from that file.
-    try:
-        import subprocess as _sp
-        _orb_script = os.path.join(INSTALL_DIR, "analysis", "get_orb_range.py")
-        _result = _sp.run(
-            [sys.executable, _orb_script, INSTRUMENT],
-            capture_output=True, text=True, timeout=30
-        )
-        if _result.returncode == 0:
-            logger.info(f"Startup ORB: {_result.stdout.strip()}")
-        else:
-            logger.warning(f"ORB range fetch failed: {_result.stderr.strip()}")
-    except Exception as e:
-        logger.warning(f"ORB range fetch skipped: {e}")
+    _fetch_orb_range(os.environ.get("OT_INSTRUMENT", INSTRUMENT))
 
     logger.info(
         f"OptionsBot ready | "
