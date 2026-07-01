@@ -723,10 +723,23 @@ def _recover_open_position(state: BotState):
 
 
 def _fetch_orb_range(instrument: str = ""):
-    """Fetch and write orb_range.json. Called at startup and at RTH open."""
+    """Fetch and write orb_range.json. Called at startup and at RTH open.
+    Reads the instrument directly from the systemd unit file at call time
+    so it always reflects the live configured value, not a stale env var.
+    """
     try:
         import subprocess as _sp
-        _symbol = os.environ.get("OT_INSTRUMENT", instrument or "QQQ")
+        import re as _re
+        _unit = "/etc/systemd/system/optionsbot.service"
+        _symbol = instrument or "QQQ"
+        try:
+            with open(_unit) as _f:
+                _unit_text = _f.read()
+            _m = _re.search(r'Environment=OT_INSTRUMENT=(\S+)', _unit_text)
+            if _m:
+                _symbol = _m.group(1)
+        except Exception:
+            pass
         _install_dir = os.path.expanduser("~/options-trader")
         _orb_script = os.path.join(_install_dir, "analysis", "get_orb_range.py")
         _result = _sp.run(
