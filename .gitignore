@@ -36,3 +36,4 @@ Thumbs.db
 *.tar.gz
 *.ziptrades.db-shm
 trades.db-wal
+orb_range.json echo analysis/orb_range.json
