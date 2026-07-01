@@ -528,6 +528,74 @@ class ExitEngine:
 
     # \u2500\u2500\u2500 Shared Helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
+    def _evaluate_condor_leg(self, record: TradeRecord,
+                              current_premium: float,
+                              regime: Optional[str] = None) -> ExitDecision:
+        """
+        Iron condor leg exit logic.
+        Each leg is a credit spread — rising spread value = losing money.
+
+        Regime-flip exits are DIRECTION-AWARE:
+          - Call spread: only exit on TRENDING_BULL or BREAKOUT_VOLATILE
+            (price moving toward short calls). TRENDING_BEAR is favorable — hold.
+          - Put spread: only exit on TRENDING_BEAR or BREAKOUT_VOLATILE
+            (price moving toward short puts). TRENDING_BULL is favorable — hold.
+          - Leg 2 cancellation on favorable flips handled by check_leg_triggers().
+
+        Exits: hard close, adverse regime flip, 25% stop, $0.05 nickel close.
+        """
+        from config import CONDOR_NICKEL_CLOSE, CONDOR_STOP_LOSS_PCT
+
+        decision    = ExitDecision()
+        trade_id    = record["trade_id"]
+        entry_prem  = record["entry_premium"]
+        option_side = record.get("option_side", "")
+
+        pnl_pct = (entry_prem - current_premium) / entry_prem if entry_prem > 0 else 0
+        pnl_usd = (entry_prem - current_premium) * record["contracts"] * CONTRACT_MULTIPLIER
+        decision.current_pnl_pct = pnl_pct
+        decision.current_pnl_usd = pnl_usd
+
+        if is_hard_close_time():
+            decision.should_exit = True
+            decision.exit_reason = "hard_close_15:45_ET"
+            return decision
+
+        TRENDING_REGIMES = {"TRENDING_BULL", "TRENDING_BEAR", "BREAKOUT_VOLATILE"}
+        if regime and regime in TRENDING_REGIMES:
+            adverse = False
+            if option_side == "call" and regime in ("TRENDING_BULL", "BREAKOUT_VOLATILE"):
+                adverse = True
+            elif option_side == "put" and regime in ("TRENDING_BEAR", "BREAKOUT_VOLATILE"):
+                adverse = True
+
+            if adverse:
+                decision.should_exit = True
+                decision.exit_reason = f"regime_flip_adverse: {regime} threatens {option_side} spread"
+                logger.info(
+                    f"CONDOR LEG ADVERSE EXIT: {trade_id[:8]} — "
+                    f"{regime} moving into {option_side} short strikes"
+                )
+                return decision
+            else:
+                logger.info(
+                    f"CONDOR LEG: {regime} flip FAVORABLE for {option_side} spread "
+                    f"(pnl={pnl_pct:.1%}) — holding, Leg 2 will be cancelled by strategy"
+                )
+
+        stop_level = entry_prem * (1 + CONDOR_STOP_LOSS_PCT)
+        if current_premium >= stop_level:
+            decision.should_exit = True
+            decision.exit_reason = f"condor_stop pnl={pnl_pct:.1%}"
+            return decision
+
+        if current_premium <= CONDOR_NICKEL_CLOSE:
+            decision.should_exit = True
+            decision.exit_reason = f"nickel_close pnl={pnl_pct:.1%}"
+            return decision
+
+        return decision
+
     def _get_bos_tracker(self, trade_id: str,
                           direction: str,
                           entry_price: float) -> BOSTracker:

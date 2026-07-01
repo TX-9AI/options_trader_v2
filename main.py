@@ -129,6 +129,23 @@ def run_analysis(state: BotState) -> dict:
     # ORB engine update (every tick during RTH)
     orb = get_orb_engine().update(df_5m, df_1m, price)
 
+    # Write ORB state to JSON file so status.py can read it directly
+    # without parsing bot.log — eliminates all log-parsing timing issues
+    try:
+        import json as _json
+        _orb_state = {
+            "high":    orb.orb_high if orb.orb_high > 0 else None,
+            "low":     orb.orb_low  if orb.orb_low  > 0 else None,
+            "width":   orb.orb_width,
+            "state":   orb.state,
+            "attempt": orb.attempt_number,
+        }
+        _state_path = os.path.join(os.path.dirname(LOG_FILE), "orb_state.json")
+        with open(_state_path, "w") as _f:
+            _json.dump(_orb_state, _f)
+    except Exception:
+        pass
+
     return {
         "price":     price,
         "data":      data,
@@ -493,6 +510,19 @@ def handle_session_reset(state: BotState):
         state.orb_reset_done     = False
 
     if not state.orb_reset_done:
+        # Fetch today's fresh ORB range before resetting engine state
+        try:
+            import subprocess as _sp
+            _r = _sp.run(
+                [sys.executable, os.path.join(os.path.dirname(LOG_FILE), "analysis", "get_orb_range.py"), INSTRUMENT],
+                capture_output=True, text=True, timeout=30
+            )
+            if _r.returncode == 0:
+                logger.info(f"RTH open: {_r.stdout.strip()}")
+            else:
+                logger.warning(f"RTH ORB fetch failed: {_r.stderr.strip()}")
+        except Exception as _e:
+            logger.warning(f"RTH ORB fetch skipped: {_e}")
         get_orb_engine().reset_for_session()
         state.orb_reset_done = True
         logger.info("ORB engine reset for new session")
@@ -763,27 +793,23 @@ def main():
     # that position within seconds — not waiting for the first loop cycle.
     _recover_open_position(state)
 
-    # ── Pre-load ORB range from historical data ──────────────────────────────
-    # Runs at every startup regardless of time of day so status.py always
-    # shows the last known 9:30-9:35 ET range instead of "Waiting for 9:35".
-    # The range is fetched from yfinance historical 5m data — no live session
-    # required. Outside RTH this correctly shows as EXPIRED with real H/L/width.
+    # ── Fetch ORB range via get_orb_range.py ────────────────────────────────
+    # Single source of truth: analysis/get_orb_range.py fetches the most
+    # recent 9:30-9:35 ET candle and writes orb_range.json. Both
+    # orb_engine.py and status.py read from that file.
     try:
-        from data.data_cache import get_cache
-        _startup_data = get_cache().get_all()
-        _df5m = _startup_data.get("5m")
-        if _df5m is not None and not _df5m.empty:
-            get_orb_engine()._set_orb_range(_df5m)
-            # If we're past the entry cutoff or outside RTH, mark EXPIRED
-            # so status.py shows the correct state while preserving H/L/width
-            from utils.time_utils import is_past_entry_cutoff, is_rth
-            if is_past_entry_cutoff() or not is_rth():
-                get_orb_engine().data.state = "EXPIRED"
-            logger.info("Startup: ORB range pre-loaded from historical data")
+        import subprocess as _sp
+        _orb_script = os.path.join(INSTALL_DIR, "analysis", "get_orb_range.py")
+        _result = _sp.run(
+            [sys.executable, _orb_script, INSTRUMENT],
+            capture_output=True, text=True, timeout=30
+        )
+        if _result.returncode == 0:
+            logger.info(f"Startup ORB: {_result.stdout.strip()}")
         else:
-            logger.debug("Startup: no 5m data available for ORB pre-load")
+            logger.warning(f"ORB range fetch failed: {_result.stderr.strip()}")
     except Exception as e:
-        logger.debug(f"Startup ORB pre-load skipped: {e}")
+        logger.warning(f"ORB range fetch skipped: {e}")
 
     logger.info(
         f"OptionsBot ready | "

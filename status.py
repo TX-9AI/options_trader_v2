@@ -119,6 +119,7 @@ def get_regime_and_orb():
     gex_pin   = None
     gex_env   = None
 
+    # ORB range: read directly from orb_range.json — no log parsing
     orb = {
         "high":    None,
         "low":     None,
@@ -126,6 +127,18 @@ def get_regime_and_orb():
         "state":   "UNKNOWN",
         "attempt": 0,
     }
+
+    orb_range_file = os.path.join(INSTALL_DIR, "orb_range.json")
+    if os.path.exists(orb_range_file):
+        try:
+            import json
+            with open(orb_range_file) as f:
+                orb_data = json.load(f)
+            orb["high"]  = orb_data.get("high")
+            orb["low"]   = orb_data.get("low")
+            orb["width"] = orb_data.get("width")
+        except Exception:
+            pass
 
     if not os.path.exists(log_path):
         return regime, strategy, orb, gex_pin, gex_env
@@ -150,17 +163,6 @@ def get_regime_and_orb():
 
             if "STRATEGY: NO TRADE" in line and strategy == "UNKNOWN":
                 strategy = "No Trade"
-
-            if orb["high"] is None and "ORB range set:" in line:
-                try:
-                    h = re.search(r"high=([\d.]+)", line)
-                    l = re.search(r"low=([\d.]+)", line)
-                    w = re.search(r"width=([\d.]+)", line)
-                    if h: orb["high"]  = float(h.group(1))
-                    if l: orb["low"]   = float(l.group(1))
-                    if w: orb["width"] = float(w.group(1))
-                except Exception:
-                    pass
 
             if orb["state"] == "UNKNOWN":
                 if "ORB CONFIRMED LONG" in line:
