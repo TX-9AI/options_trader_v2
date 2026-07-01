@@ -37,3 +37,5 @@ Thumbs.db
 *.ziptrades.db-shm
 trades.db-wal
 orb_range.json echo analysis/orb_range.json
+orb_range.json
+orb_state.json
