@@ -30,12 +30,20 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 
 ET = ZoneInfo("US/Eastern")
-OUTPUT_PATH = os.path.expanduser("~/options-trader/orb_range.json")
+OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orb_range.json")
 
+
+# Map bot instrument names to yfinance ticker symbols
+SYMBOL_MAP = {
+    "QQQ": "QQQ",
+    "SPY": "SPY",
+    "SPX": "^GSPC",
+}
 
 def fetch_orb_range(symbol: str = "QQQ") -> dict:
     """Fetch the most recent 9:30 ET 5-min candle for the given symbol."""
-    df = yf.download(symbol, period="5d", interval="5m", progress=False)
+    yf_symbol = SYMBOL_MAP.get(symbol.upper(), symbol)
+    df = yf.download(yf_symbol, period="5d", interval="5m", progress=False)
     if df.empty:
         raise ValueError(f"No 5m data returned for {symbol}")
 
@@ -63,7 +71,7 @@ def fetch_orb_range(symbol: str = "QQQ") -> dict:
         "low":        round(float(candle["low"]),  4),
         "width":      round(float(candle["high"]) - float(candle["low"]), 4),
         "fetched_at": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
-        "symbol":     symbol,
+        "symbol":     symbol,  # original instrument name, not yfinance ticker
     }
 
 
