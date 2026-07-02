@@ -1,43 +1,38 @@
 #!/usr/bin/env python3
 """
-analysis/get_orb_range.py — Resolve the opening-range for the instrument and
+analysis/get_orb_range.py — Resolve the opening range for the instrument and
 write it to orb_range.json with an explicit STATE. Always writes the last
 valid range so consumers always have something to show; the state tells them
 what that range represents.
 
+CRITICAL: the opening candle is fetched through the bot's own data layer
+(data.market_data.fetch_candles) — the SAME source and symbol mapping the rest
+of the bot uses (e.g. SPX -> ^SPX). Earlier versions fetched ^GSPC directly via
+yfinance, a DIFFERENT Yahoo symbol than the bot's ^SPX feed, so the ORB range
+never matched the bot's price feed or the operator's chart. Never fetch here
+with a private symbol map again — always go through fetch_candles.
+
 Three states only (the "call-out"):
     ESTABLISHED  — today's 9:30-9:35 ET candle is closed. high/low/date are
-                   today's. This is the only tradeable state.
-    IN_PROGRESS  — right now is inside today's opening candle (09:30:00-09:34:59
-                   ET). Today's range is still forming; high/low/date carry the
-                   LAST valid RTH range until the candle closes.
+                   today's. The only tradeable state.
+    IN_PROGRESS  — now is inside today's opening candle (09:30:00-09:34:59 ET).
+                   Today's range is still forming; high/low/date carry the LAST
+                   valid RTH range until the candle closes.
     EXPIRED      — no today range yet (pre-open, or today's candle not on the
                    feed yet). high/low/date carry the LAST valid RTH range
                    (e.g. Friday's on a Monday pre-open).
 
-v1.0 — original — most-recent 9:30 candle in a 5d window, no date/state guard
-        (wrote yesterday's range as today's before 9:35). Instrument resolved
-        via a sudo `systemctl show` subprocess.
-v1.1 — 2026-07-02 — strict today-only + completeness gating; wrote nothing
-        before the candle was ready.
-v1.2 — 2026-07-02 — replace strict/refuse behavior with the three-state model
-        above. Always write the last valid range; classify it ESTABLISHED /
-        IN_PROGRESS / EXPIRED. Instrument from argv[1] -> OT_INSTRUMENT -> QQQ.
+v1.0 — original — ^GSPC via direct yfinance, most-recent 9:30 candle, no guard.
+v1.1 — 2026-07-02 — strict today-only gating (wrote nothing before ready).
+v1.2 — 2026-07-02 — three-state model; always write the last valid range.
+v1.3 — 2026-07-02 — SOURCE FIX: fetch the opening candle via
+        data.market_data.fetch_candles() so the range uses the identical feed
+        and symbol as the bot (^SPX for SPX, not ^GSPC). Removed the private
+        yfinance import and SYMBOL_MAP entirely.
 
 Exit codes (consumed by main._fetch_orb_range):
     0 = ESTABLISHED   1 = hard error (no data / write failure)
     2 = IN_PROGRESS   3 = EXPIRED
-
-Output file: ~/options-trader/orb_range.json
-{
-    "status": "ESTABLISHED",
-    "date": "2026-07-01",
-    "high": 729.70,
-    "low":  725.98,
-    "width": 3.72,
-    "fetched_at": "2026-07-01 09:36:00 ET",
-    "symbol": "QQQ"
-}
 """
 
 import json
@@ -46,7 +41,10 @@ import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
+# Make the install root importable so this standalone script can reuse the
+# bot's own data layer instead of duplicating symbol maps / fetch logic.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from data.market_data import fetch_candles
 
 ET = ZoneInfo("US/Eastern")
 OUTPUT_PATH = os.path.expanduser("~/options-trader/orb_range.json")
@@ -61,19 +59,21 @@ EXIT_CODE = {
     STATUS_EXPIRED:     3,
 }
 
-SYMBOL_MAP = {"QQQ": "QQQ", "SPY": "SPY", "SPX": "^GSPC"}
+# Enough 5m candles to always include at least one prior trading day's open
+# (for the EXPIRED/IN_PROGRESS carry) even across a weekend.
+ORB_CANDLE_LOOKBACK = 200
 
 
 def resolve_symbol() -> str:
-    """argv[1] -> OT_INSTRUMENT env -> QQQ. No systemd/subprocess."""
+    """argv[1] -> OT_INSTRUMENT env -> QQQ."""
     if len(sys.argv) > 1 and sys.argv[1].strip():
         return sys.argv[1].strip()
     return os.environ.get("OT_INSTRUMENT", "QQQ")
 
 
-def _candle_to_range(ts, candle, status: str, symbol: str, now: datetime) -> dict:
-    high = float(candle["high"])
-    low = float(candle["low"])
+def _candle_to_range(ts, row, status: str, symbol: str, now: datetime) -> dict:
+    high = float(row["high"])
+    low = float(row["low"])
     return {
         "status":     status,
         "date":       ts.strftime("%Y-%m-%d"),
@@ -95,28 +95,17 @@ def resolve_orb_range(symbol: str) -> dict:
     # Today's opening candle is forming during 09:30:00-09:34:59 ET.
     in_opening_window = (now.hour == 9 and 30 <= now.minute <= 34)
 
-    yf_symbol = SYMBOL_MAP.get(symbol.upper(), symbol)
-    df = yf.download(yf_symbol, period="5d", interval="5m", progress=False)
-    if df.empty:
+    # SAME feed/symbol as the bot (SPX -> ^SPX). ET-indexed OHLCV, lowercase cols.
+    df = fetch_candles(symbol, "5m", ORB_CANDLE_LOOKBACK)
+    if df is None or df.empty:
         raise ValueError(f"no 5m data returned for {symbol}")
 
-    if hasattr(df.columns, "levels"):
-        df.columns = df.columns.get_level_values(0)
-    df.columns = [str(c).lower() for c in df.columns]
-
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC").tz_convert(ET)
-    else:
-        df.index = df.index.tz_convert(ET)
-
-    # All 9:30 opening candles in the window, split into today's vs prior days'.
     opens = [(ts, row) for ts, row in df.iterrows()
              if ts.hour == 9 and ts.minute == 30]
     todays = [(ts, row) for ts, row in opens if ts.date() == today]
     priors = [(ts, row) for ts, row in opens if ts.date() < today]
 
     def last_valid_prior():
-        # Most recent completed prior-day opening candle with a real range.
         for ts, row in reversed(priors):
             if float(row["high"]) > float(row["low"]):
                 return ts, row
@@ -139,7 +128,7 @@ def resolve_orb_range(symbol: str) -> dict:
     # ── EXPIRED: pre-open, or today's candle not on the feed yet ──
     pv = last_valid_prior()
     if pv is None:
-        raise ValueError("no valid opening range found in 5d window")
+        raise ValueError("no valid opening range found in lookback window")
     return _candle_to_range(pv[0], pv[1], STATUS_EXPIRED, symbol, now)
 
 

@@ -3,6 +3,12 @@ risk/risk_manager.py — Position sizing and session circuit breaker.
 v1.0 — original release
 v1.1 — 2026-06-27 — remove TRADE_GRADE_C and Twilio references,
         clean up Grade C sizing logic
+v1.2 — 2026-07-02 — session loss limit no longer halts the session. Hitting
+        SESSION_LOSS_LIMIT now REQUESTS a regime reassessment (consumed by the
+        main loop) instead of stopping the service. Rationale: a 2-loss count
+        breaker was too blunt — it would kill sessions that are still net
+        profitable. Removed _fire_circuit_breaker()/systemctl-stop and the
+        session_halted semantics.
 
 Sizing model:
   - Fixed dollar risk per trade (operator-set at startup)
@@ -10,9 +16,12 @@ Sizing model:
   - cost_per_contract = mark × 100 (single leg) or net_debit × 100 (butterfly)
   - Always whole contracts; minimum 1 if affordable
 
-Session circuit breaker:
-  - 2 closed losses in one RTH session → halt session
-  - Paper mode: circuit breaker fires and logs, but does NOT halt
+Session loss limit (NOT a halt):
+  - Reaching SESSION_LOSS_LIMIT losses in an RTH session sets a one-shot
+    reassessment request. main_loop consumes it and forces a fresh regime
+    classification. Trading continues; the bot re-reads the market.
+  - NOTE (live): this intentionally removes the hard stop. For live capital a
+    separate $-based session backstop is advisable — not implemented here.
 """
 
 import logging
@@ -66,9 +75,9 @@ class RiskManager:
                  paper_trading: bool = PAPER_TRADING):
         self._risk_per_trade   = risk_per_trade
         self._paper_trading    = paper_trading
-        self._session_losses   = 0
-        self._session_halted   = False
-        self._cb_fired_ids:    set = set()
+        self._session_losses     = 0
+        self._session_halted     = False   # retained for API compat; never set
+        self._reassess_requested = False
 
     def update_risk(self, risk_usd: float):
         self._risk_per_trade = risk_usd
@@ -137,16 +146,12 @@ class RiskManager:
         return result
 
     def check_circuit_breaker(self) -> CircuitBreakerState:
-        state = CircuitBreakerState(
+        # No halt semantics anymore — the loss limit triggers a reassessment,
+        # not a stop. Reported state is always non-halted.
+        return CircuitBreakerState(
             session_losses=self._session_losses,
-            session_halted=self._session_halted
+            session_halted=False,
         )
-        if self._session_halted:
-            state.reason = (
-                f"Session circuit breaker: {self._session_losses} losses — "
-                f"halted for rest of session. Restart tomorrow."
-            )
-        return state
 
     def record_loss(self):
         self._session_losses += 1
@@ -155,10 +160,16 @@ class RiskManager:
             f"(limit={SESSION_LOSS_LIMIT})"
         )
         if self._session_losses >= SESSION_LOSS_LIMIT:
-            cb_id = f"session_{self._session_losses}"
-            if cb_id not in self._cb_fired_ids:
-                self._cb_fired_ids.add(cb_id)
-                self._fire_circuit_breaker()
+            # Loss limit reached: request a regime reassessment (consumed by
+            # main_loop) — do NOT halt. Each further loss re-requests it, so
+            # the bot keeps re-reading the market rather than quitting a
+            # session that may still be net profitable.
+            self._reassess_requested = True
+            logger.warning(
+                f"⚠ Loss limit reached ({self._session_losses}/"
+                f"{SESSION_LOSS_LIMIT}) — forcing regime reassessment "
+                f"(session NOT halted)."
+            )
 
     def record_win(self):
         logger.info(
@@ -166,28 +177,18 @@ class RiskManager:
             f"(session_losses={self._session_losses})"
         )
 
-    def _fire_circuit_breaker(self):
-        self._session_halted = True
-        logger.warning(
-            f"🚨 SESSION CIRCUIT BREAKER FIRED: "
-            f"{self._session_losses} losses in this session "
-            f"(limit={SESSION_LOSS_LIMIT}). "
-            f"Bot halted until restart."
-        )
-        if not self._paper_trading:
-            import subprocess, os
-            service = os.environ.get("OPTIONSBOT_SERVICE", SERVICE_NAME)
-            try:
-                subprocess.Popen(["sudo", "systemctl", "stop", service])
-            except Exception as e:
-                logger.error(f"Failed to stop service: {e}")
-        else:
-            logger.info("[PAPER] Circuit breaker fired — paper mode, not stopping service")
+    def consume_reassess_request(self) -> bool:
+        """Edge-triggered. Returns True once after the loss limit requested a
+        regime reassessment, then clears the request."""
+        if self._reassess_requested:
+            self._reassess_requested = False
+            return True
+        return False
 
     def reset_session(self):
-        self._session_losses = 0
-        self._session_halted = False
-        self._cb_fired_ids.clear()
+        self._session_losses     = 0
+        self._session_halted     = False
+        self._reassess_requested = False
         logger.info("Risk manager session reset")
 
     @property
@@ -202,7 +203,7 @@ class RiskManager:
         return (
             f"risk=${self._risk_per_trade:.0f}/trade "
             f"session_losses={self._session_losses}/{SESSION_LOSS_LIMIT} "
-            f"halted={self._session_halted}"
+            f"(loss-limit -> regime reassessment, no halt)"
         )
 
 

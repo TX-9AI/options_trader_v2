@@ -14,6 +14,13 @@ v1.5 — 2026-07-02 — remove early break from log scan so regime is always
 v1.6 — 2026-07-02 — read regime from database (regime_log table) instead
         of log parsing — reliable across restarts and outside RTH.
 v1.7 — 2026-07-02 — fix regime_log query: ORDER BY logged_at not timestamp.
+v1.9 — 2026-07-02 — reword loss-limit banner: the limit now forces a regime
+        reassessment (session continues), not a halt.
+v1.8 — 2026-07-02 — consume the orb_range.json "status" field (ESTABLISHED/
+        IN_PROGRESS/EXPIRED) instead of inventing ORB state from the clock.
+        Only an ESTABLISHED range dated today is shown as live; EXPIRED and
+        IN_PROGRESS ranges are labeled as such with their date, so a carried
+        prior-session range can never be shown as "watching for break".
 
 Run: python status.py
 
@@ -113,6 +120,9 @@ ORB_STATE_LABELS = {
     "OPEN_LONG":                   "OPEN LONG (confirmed)",
     "OPEN_SHORT":                  "OPEN SHORT (confirmed)",
     "EXPIRED":                     "Expired (past 2PM cutoff)",
+    "IN_PROGRESS":                 "Opening range forming (9:30-9:35 ET)",
+    "EXPIRED_RANGE":               "Last session's range - today NOT established",
+    "NOT_ESTABLISHED":             "Today's range not established",
     "UNKNOWN":                     "Unknown",
 }
 
@@ -142,17 +152,27 @@ def get_regime_and_orb():
             orb["high"]  = orb_data.get("high")
             orb["low"]   = orb_data.get("low")
             orb["width"] = orb_data.get("width")
-            # Derive state from time — no log parsing needed
-            now = datetime.now(ET)
-            hm  = (now.hour, now.minute)
-            if not (9 <= now.hour < 16):
-                orb["state"] = "EXPIRED"
-            elif hm >= (14, 0):
-                orb["state"] = "EXPIRED"
-            elif hm >= (9, 35):
-                orb["state"] = "RANGING"
+            orb["range_status"] = str(orb_data.get("status", "")).upper()
+            orb["range_date"]   = orb_data.get("date")
+
+            today = datetime.now(ET).strftime("%Y-%m-%d")
+            if orb["range_status"] == "ESTABLISHED" and orb["range_date"] == today:
+                # Today's live range — infer engine state from the clock;
+                # the log scan below refines it (break/retest/confirmed).
+                now = datetime.now(ET)
+                hm  = (now.hour, now.minute)
+                if not (9 <= now.hour < 16) or hm >= (14, 0):
+                    orb["state"] = "EXPIRED"
+                elif hm >= (9, 35):
+                    orb["state"] = "RANGING"
+                else:
+                    orb["state"] = "WAITING"
+            elif orb["range_status"] == "IN_PROGRESS":
+                orb["state"] = "IN_PROGRESS"
+            elif orb["range_status"] == "EXPIRED":
+                orb["state"] = "EXPIRED_RANGE"
             else:
-                orb["state"] = "WAITING"
+                orb["state"] = "NOT_ESTABLISHED"
         except Exception:
             pass
 
@@ -187,7 +207,9 @@ def get_regime_and_orb():
             if "STRATEGY: NO TRADE" in line and strategy == "UNKNOWN":
                 strategy = "No Trade"
 
-            if orb["state"] == "UNKNOWN":
+            _live_today = (orb.get("range_status") == "ESTABLISHED"
+                           and orb.get("range_date") == datetime.now(ET).strftime("%Y-%m-%d"))
+            if _live_today and orb["state"] in ("UNKNOWN", "RANGING", "WAITING"):
                 if "ORB CONFIRMED LONG" in line:
                     orb["state"] = "OPEN_LONG"
                 elif "ORB CONFIRMED SHORT" in line:
@@ -210,7 +232,7 @@ def get_regime_and_orb():
                     orb["state"] = "RANGING"
                     m = re.search(r"attempt #(\d+)", line)
                     if m: orb["attempt"] = int(m.group(1))
-                elif "ORB range set:" in line:
+                elif "ORB range ESTABLISHED:" in line:
                     orb["state"] = "RANGING"
                 elif "ORB engine reset" in line:
                     orb["state"] = "WAITING"
@@ -325,6 +347,10 @@ def main():
                 orb["state"] = "EXPIRED"
         state_label = ORB_STATE_LABELS.get(orb["state"], orb["state"])
         attempt_str = f"  (attempt #{orb['attempt']})" if orb["attempt"] > 0 else ""
+        if orb.get("range_status"):
+            rs = orb["range_status"]
+            date_note = f"  [{orb.get('range_date')}]" if rs != "ESTABLISHED" else ""
+            print(f"      Range:       {rs}{date_note}")
         print(f"      State:       {state_label}{attempt_str}")
     else:
         print(f"  \u23F1  ORB:         Waiting for 9:35 ET range to be set")
@@ -403,7 +429,8 @@ def main():
         wr     = wins / total * 100 if total else 0
         cb_warning = ""
         if losses >= SESSION_LOSS_LIMIT:
-            cb_warning = "  \u26A0  CIRCUIT BREAKER FIRED"
+            cb_warning = ("  \u26A0  LOSS LIMIT REACHED "
+                          "\u2192 regime reassessment (session continues)")
         print(f"  Trades:       {total}  ({wins}W / {losses}L)")
         print(f"  Win rate:     {wr:.0f}%")
         print(f"  Net P&L:      {usd(pnl)}")

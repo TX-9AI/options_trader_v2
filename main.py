@@ -13,6 +13,9 @@ v2.4 — 2026-07-02 — remove duplicate _execute_condor_leg (dead 2-arg def sha
         and the startup fetch is gated to >= 9:35 ET so it never writes a
         stale prior-day range; instrument read from OT_INSTRUMENT (no systemd
         unit-file parsing).
+v2.6 — 2026-07-02 — session loss limit forces a regime reassessment instead of
+        halting: main_loop consumes RiskManager.consume_reassess_request() and
+        reclassifies with trigger="loss_limit".
 v2.5 — 2026-07-02 — ORB range is now three-state (ESTABLISHED/IN_PROGRESS/
         EXPIRED) and always carries the last valid range. Startup fetch runs
         unconditionally (populates last-valid EXPIRED range pre-open); the
@@ -562,8 +565,11 @@ def main_loop(state: BotState):
                 state.last_regime_at is None or
                 minutes_since(state.last_regime_at) >= REGIME_REASSESS_MINUTES
             )
-            if should_reassess:
-                regime = run_regime_classification(ctx, "scheduled", state)
+            # Session loss limit forces an off-schedule reassessment (no halt).
+            loss_reassess = get_risk_manager().consume_reassess_request()
+            if should_reassess or loss_reassess:
+                trigger = "loss_limit" if loss_reassess else "scheduled"
+                regime = run_regime_classification(ctx, trigger, state)
             else:
                 regime = state.current_regime
 
