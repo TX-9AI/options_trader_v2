@@ -13,6 +13,8 @@ v1.5 — 2026-07-02 — multi-position support for legged condors: hold up to tw
         verticals at once (condor ONLY; every other strategy stays single),
         manage each independently, mark a leg as short_mark - long_mark, and
         invert P&L sign for credit spreads.
+v1.6 — 2026-07-02 — add remove_record() for the broken-wing roll (drops the old
+        untested vertical when it is rolled).
 """
 
 import logging
@@ -65,6 +67,12 @@ class PositionManager:
 
     def get_open_records(self) -> List[TradeRecord]:
         return list(self._open_records)
+
+    def remove_record(self, trade_id: str):
+        """Drop a record from active management (used by the broken-wing roll
+        when it closes the old untested vertical)."""
+        self._open_records = [r for r in self._open_records
+                              if r.get("trade_id") != trade_id]
 
     def manage_open_position(self,
                               df_1m: Optional[pd.DataFrame] = None,

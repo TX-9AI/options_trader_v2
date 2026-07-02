@@ -13,6 +13,10 @@ v2.4 — 2026-07-02 — remove duplicate _execute_condor_leg (dead 2-arg def sha
         and the startup fetch is gated to >= 9:35 ET so it never writes a
         stale prior-day range; instrument read from OT_INSTRUMENT (no systemd
         unit-file parsing).
+v2.8 — 2026-07-02 — (2a) ORB-window sweep override: when an ORB signal fires but
+        a sweep reversal has higher conviction, take the sweep. (2b) pass the
+        current regime into the ORB engine for regime-gated re-arm. (#3) run
+        the broken-wing roll check when both condor verticals are open.
 v2.7 — 2026-07-02 — condor legs are now TRACKED positions: each vertical is
         sized at half the grade budget, written to the trade log, registered
         with the position manager (the only two-position strategy), and
@@ -154,8 +158,10 @@ def run_analysis(state: BotState) -> dict:
     liq_map   = get_liquidity_mapper().analyze(df_5m, df_15m, price)
     macro     = get_macro_manager().get()
 
-    # ORB engine update (every tick during RTH)
-    orb = get_orb_engine().update(df_5m, df_1m, price)
+    # ORB engine update (every tick during RTH). Pass last-tick regime so the
+    # engine can gate its re-arm decision (this runs before reclassification).
+    _regime_str = state.current_regime.primary_regime if state.current_regime else None
+    orb = get_orb_engine().update(df_5m, df_1m, price, _regime_str)
 
     # Write ORB state to JSON file so status.py can read it directly
     # without parsing bot.log — eliminates all log-parsing timing issues
@@ -405,7 +411,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
                 Regime.TRENDING_BULL, Regime.TRENDING_BEAR,
                 Regime.BREAKOUT_VOLATILE, Regime.RANGING, Regime.COMPRESSION
             )):
-        signal = _orb_strategy.generate_signal(
+        orb_sig = _orb_strategy.generate_signal(
             orb           = orb,
             regime        = regime,
             vol_state     = ctx["vol"],
@@ -414,8 +420,30 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
             macro         = macro,
             current_price = ctx["price"]
         )
-        if signal:
-            get_orb_engine().mark_triggered()
+        if orb_sig:
+            signal = orb_sig
+            # ORB-window override: during the ORB window, if a sweep reversal is
+            # setting up with HIGHER probability than the ORB, take the sweep.
+            # A breakout-without-retest is exactly when sweep odds spike.
+            if regime.sweep_recent:
+                sweep_sig = _sweep_strategy.generate_signal(
+                    regime        = regime,
+                    vol_state     = ctx["vol"],
+                    structure     = ctx["structure"],
+                    liq_map       = ctx["liq_map"],
+                    chain         = chain,
+                    macro         = macro,
+                    df_1m         = ctx.get("df_1m"),
+                    current_price = ctx["price"]
+                )
+                if sweep_sig and getattr(sweep_sig, "conviction", 0.0) > getattr(orb_sig, "conviction", 0.0):
+                    logger.info(
+                        f"ORB-window override: sweep conviction "
+                        f"{sweep_sig.conviction:.2f} > ORB {orb_sig.conviction:.2f} — taking sweep"
+                    )
+                    signal = sweep_sig
+            if signal is orb_sig:
+                get_orb_engine().mark_triggered()
 
     # Priority 2: Sweep Reversal
     if signal is None and regime.primary_regime == Regime.SWEEP_REVERSAL:
@@ -665,6 +693,16 @@ def main_loop(state: BotState):
                     )
                     if leg_signal is not None:
                         _execute_condor_leg(leg_signal, state)
+
+                # ── Broken-wing roll check ────────────────────────────────
+                # Both condor verticals open + one side tested → roll the
+                # untested side into a BWB if it makes the tested side
+                # risk-free. One-time, final adjustment.
+                try:
+                    from strategy.condor_roll import check_and_execute_roll
+                    check_and_execute_roll(pos_mgr, ctx.get("chain"), ctx["price"], state)
+                except Exception as _roll_err:
+                    logger.warning(f"Roll check failed: {_roll_err}")
             else:
                 attempt_new_entry(ctx, regime, state)
 

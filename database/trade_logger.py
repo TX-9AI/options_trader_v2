@@ -6,6 +6,8 @@ v1.1 — 2026-06-27 — add orb_range_high, orb_range_low, current_premium
 v1.2 — 2026-07-02 — condor-leg support: spread columns (short/long strike,
         credit, width, is_condor_leg, condor_leg_num, is_broken_wing,
         short/long symbol) + get_open_trades() for concurrent condor legs.
+v1.3 — 2026-07-02 — add generic update_fields() (used by the broken-wing roll
+        to flag rolled/tested legs is_broken_wing).
 """
 
 import logging
@@ -207,6 +209,15 @@ class TradeLogger:
                 "UPDATE trades SET current_premium=? WHERE trade_id=?",
                 (premium, trade_id)
             )
+
+    def update_fields(self, trade_id: str, **fields):
+        """Generic field updater (used by the broken-wing roll to flag legs)."""
+        if not fields:
+            return
+        sets = ", ".join(f"{k}=?" for k in fields)
+        vals = list(fields.values()) + [trade_id]
+        with self._connect() as conn:
+            conn.execute(f"UPDATE trades SET {sets} WHERE trade_id=?", vals)
 
     def get_open_trade(self) -> Optional[TradeRecord]:
         """Return the single open trade if any."""

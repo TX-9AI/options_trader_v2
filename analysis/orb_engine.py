@@ -9,6 +9,11 @@ v1.3 — 2026-07-01 — ORB range now read from orb_range.json (written by
 v1.4 — 2026-07-02 — fix _range_date comparison: now stored as string from
         JSON date field so today check works correctly and engine stops
         reloading orb_range.json every tick after range is set.
+v1.7 — 2026-07-02 — regime-gated re-arm: after a (b) close-inside invalidation,
+        re-arm and watch for another break ONLY while the regime is still
+        ORB-friendly (RANGING/COMPRESSION). Do NOT re-arm after an (a) runaway
+        (hand off to sweep) or once the regime has shifted to sweep/trend/
+        breakout. Tracks invalidation_reason to distinguish the two.
 v1.6 — 2026-07-02 — 11:00 ET HARD cutoff (expire even awaiting-retest, so the
         bot moves to other regimes after 11:00) + two explicit invalidation
         rules: (a) price runs to the 50% TP with no retest (runaway breakout,
@@ -70,6 +75,7 @@ class ORBData:
     confirmed_at:       str   = ""
     attempt_number:     int   = 0
     entries_expired:    bool  = False
+    invalidation_reason: str  = ""   # 'runaway' | 'close_inside' | 'timeout'
 
 
 class ORBEngine:
@@ -142,7 +148,7 @@ class ORBEngine:
             logger.debug(f"ORB range file not ready: {e}")
 
     def update(self, df_5m: pd.DataFrame, df_1m: pd.DataFrame,
-               current_price: float) -> ORBData:
+               current_price: float, regime: Optional[str] = None) -> ORBData:
         d = self._data
 
         if d.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT):
@@ -177,7 +183,20 @@ class ORBEngine:
             self._check_for_retest(df_1m)
 
         if d.state == ORBState.INVALIDATED:
-            self._rearm()
+            # Re-arm ONLY after a (b) close-inside invalidation AND while the
+            # regime is still ORB-friendly. After an (a) runaway, or once the
+            # regime has shifted to sweep/trend/breakout, stand down so the bot
+            # works the other regime's setup instead. Re-checked each tick, so
+            # ORB can re-arm later if the regime returns to friendly before 11:00.
+            ORB_FRIENDLY = ("RANGING", "COMPRESSION", "UNKNOWN")
+            orb_friendly = (regime is None) or (regime in ORB_FRIENDLY)
+            if d.invalidation_reason == "close_inside" and orb_friendly:
+                self._rearm()
+            else:
+                logger.debug(
+                    f"ORB dormant after '{d.invalidation_reason}' invalidation "
+                    f"(regime={regime}) — deferring to other strategies"
+                )
 
         return d
 
@@ -239,7 +258,8 @@ class ORBEngine:
         d.bars_since_break += 1
         if d.bars_since_break > ORB_MAX_RETEST_BARS:
             d.state = ORBState.INVALIDATED
-            logger.info(f"ORB: retest timeout — INVALIDATED (re-arming)")
+            d.invalidation_reason = "timeout"
+            logger.info(f"ORB: retest timeout — INVALIDATED")
             return
 
         candle    = df_1m.iloc[-2]
@@ -255,6 +275,7 @@ class ORBEngine:
             # This is the setup that most favors a sweep reversal instead.
             if high >= d.target_50pct:
                 d.state = ORBState.INVALIDATED
+                d.invalidation_reason = "runaway"
                 logger.info(
                     f"ORB INVALIDATED: ran to 50% TP ({d.target_50pct:.2f}) "
                     f"without retest — runaway breakout (favors sweep reversal)"
@@ -267,11 +288,13 @@ class ORBEngine:
             # (b) Retrace into range — 1m candle closes back inside the ORB range.
             elif close < d.orb_high:
                 d.state = ORBState.INVALIDATED
+                d.invalidation_reason = "close_inside"
                 logger.info(f"ORB INVALIDATED: 1m close={close:.2f} back inside range")
         else:
             # (a) Runaway breakout (short) — ran to the 50% TP with no retest.
             if low <= d.target_50pct:
                 d.state = ORBState.INVALIDATED
+                d.invalidation_reason = "runaway"
                 logger.info(
                     f"ORB INVALIDATED: ran to 50% TP ({d.target_50pct:.2f}) "
                     f"without retest — runaway breakout (favors sweep reversal)"
@@ -284,6 +307,7 @@ class ORBEngine:
             # (b) Retrace into range — 1m candle closes back inside the ORB range.
             elif close > d.orb_low:
                 d.state = ORBState.INVALIDATED
+                d.invalidation_reason = "close_inside"
                 logger.info(f"ORB INVALIDATED: 1m close={close:.2f} back inside range")
 
     def mark_triggered(self):
