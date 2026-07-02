@@ -6,6 +6,9 @@ v1.2 — 2026-06-30 — fix cutoff check running before range-setting
 v1.3 — 2026-07-01 — ORB range now read from orb_range.json (written by
         analysis/get_orb_range.py). Single source of truth — no yfinance
         calls inside the engine, no log parsing, no circular logic.
+v1.4 — 2026-07-02 — fix _range_date comparison: now stored as string from
+        JSON date field so today check works correctly and engine stops
+        reloading orb_range.json every tick after range is set.
 """
 
 import json
@@ -102,7 +105,11 @@ class ORBEngine:
                 d.orb_high  = high
                 d.orb_low   = low
                 d.orb_width = width
-                self._range_date = date
+                from datetime import date as _date_type
+                try:
+                    self._range_date = str(_date_type.fromisoformat(date))
+                except Exception:
+                    self._range_date = date
                 if d.state == ORBState.WAITING:
                     d.state = ORBState.RANGING
                 logger.info(

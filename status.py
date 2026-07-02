@@ -9,6 +9,11 @@ v1.4 — 2026-06-30 — fix ORB state display: read structured ORB data (high/lo
         state/attempt) from bot.log instead of fragile string matching against
         state names that no longer exist (CONFIRMED_LONG -> OPEN_LONG, etc).
         Always show ORB H/L/width once range is set, regardless of state.
+v1.5 — 2026-07-02 — remove early break from log scan so regime is always
+        found regardless of log line order.
+v1.6 — 2026-07-02 — read regime from database (regime_log table) instead
+        of log parsing — reliable across restarts and outside RTH.
+v1.7 — 2026-07-02 — fix regime_log query: ORDER BY logged_at not timestamp.
 
 Run: python status.py
 
@@ -137,11 +142,25 @@ def get_regime_and_orb():
             orb["high"]  = orb_data.get("high")
             orb["low"]   = orb_data.get("low")
             orb["width"] = orb_data.get("width")
+            # Derive state from time — no log parsing needed
+            now = datetime.now(ET)
+            hm  = (now.hour, now.minute)
+            if not (9 <= now.hour < 16):
+                orb["state"] = "EXPIRED"
+            elif hm >= (14, 0):
+                orb["state"] = "EXPIRED"
+            elif hm >= (9, 35):
+                orb["state"] = "RANGING"
+            else:
+                orb["state"] = "WAITING"
         except Exception:
             pass
 
     if not os.path.exists(log_path):
         return regime, strategy, orb, gex_pin, gex_env
+
+    # Get regime from database — most reliable source
+    regime = get_latest_regime()
 
     try:
         result = subprocess.run(
@@ -151,10 +170,14 @@ def get_regime_and_orb():
         lines = result.stdout.strip().split("\n")
 
         for line in reversed(lines):
-            if "REGIME:" in line and regime == "UNKNOWN":
-                parts = line.split("REGIME:")
-                if len(parts) > 1:
-                    regime = parts[1].strip().split()[0]
+            if regime == "UNKNOWN":
+                if "REGIME:" in line and "→" in line:
+                    parts = line.split("REGIME:")
+                    if len(parts) > 1:
+                        regime = parts[1].strip().split()[0]
+                elif "STRATEGY: NO TRADE" in line and "regime=" in line:
+                    m = re.search(r"regime=(\S+)", line)
+                    if m: regime = m.group(1)
 
             if "STRATEGY TRANSITION:" in line and strategy == "UNKNOWN":
                 parts = line.split("\u2192")
@@ -201,15 +224,29 @@ def get_regime_and_orb():
                 except Exception:
                     pass
 
-            if (regime != "UNKNOWN" and strategy != "UNKNOWN"
-                    and orb["state"] != "UNKNOWN" and orb["high"] is not None
-                    and gex_pin is not None):
-                break
+            # Don't break early — scan all lines to ensure regime is found
+            # even when it appears near the bottom of the log
 
     except Exception:
         pass
 
     return regime, strategy, orb, gex_pin, gex_env
+
+
+def get_latest_regime():
+    """Read most recent regime from database — reliable, no log parsing."""
+    if not os.path.exists(DB_PATH):
+        return "UNKNOWN"
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT regime FROM regime_log ORDER BY logged_at DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        return row["regime"] if row else "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
 
 
 def get_open_trade():

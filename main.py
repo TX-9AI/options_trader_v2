@@ -4,6 +4,7 @@ v1.0 — original release
 v2.2 — 2026-07-01 — iron condor legged entry, BB-anchored strikes,
         regime-flip exits, ORB range via get_orb_range.py/orb_range.json,
         fed day trading enabled, ORB cutoff 11AM, condor window 11AM-2PM
+v2.3 — 2026-07-02 — fix missing ZoneInfo import causing loop error every tick
 0DTE options bot: ORB, Sweep Reversal, Butterfly
 RTH only (9:30–16:00 ET), hard close 15:45 ET.
 
@@ -21,6 +22,7 @@ import time
 import traceback
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from config import (
     POLL_INTERVAL_SECONDS, LOG_LEVEL, LOG_FILE, LOG_ROTATION_MB,
