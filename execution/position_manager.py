@@ -9,10 +9,14 @@ v1.3 — 2026-06-30 — notify ORB engine when an ORB trade closes so it re-arms
         and watches for the next breakout attempt this session
 v1.4 — 2026-06-30 — pass current regime to exit_engine.evaluate() so regime-flip
         exits can fire for butterfly and condor leg positions
+v1.5 — 2026-07-02 — multi-position support for legged condors: hold up to two
+        verticals at once (condor ONLY; every other strategy stays single),
+        manage each independently, mark a leg as short_mark - long_mark, and
+        invert P&L sign for credit spreads.
 """
 
 import logging
-from typing import Optional
+from typing import Optional, List
 
 import pandas as pd
 
@@ -34,32 +38,58 @@ class PositionManager:
 
     def __init__(self, paper_trading: bool = PAPER_TRADING):
         self.paper_trading = paper_trading
-        self._open_record: Optional[TradeRecord] = None
+        self._open_records: List[TradeRecord] = []
         self._trade_logger = get_trade_logger()
 
     def has_open_position(self) -> bool:
-        if self._open_record is not None:
+        if self._open_records:
             return True
-        record = self._trade_logger.get_open_trade()
-        if record:
-            self._open_record = record
+        # Fresh process (restart): reload any open trades from the DB.
+        trades = self._trade_logger.get_open_trades()
+        if trades:
+            self._open_records = trades
             return True
         return False
 
     def set_open_position(self, record: TradeRecord):
-        self._open_record = record
+        """Single-position strategies (ORB, sweep, butterfly): exactly one."""
+        self._open_records = [record]
+
+    def add_condor_leg(self, record: TradeRecord):
+        """The condor is the ONLY strategy allowed a second concurrent position
+        (its two verticals). Appends rather than replacing."""
+        self._open_records.append(record)
 
     def get_open_record(self) -> Optional[TradeRecord]:
-        return self._open_record
+        return self._open_records[0] if self._open_records else None
+
+    def get_open_records(self) -> List[TradeRecord]:
+        return list(self._open_records)
 
     def manage_open_position(self,
                               df_1m: Optional[pd.DataFrame] = None,
                               chain=None,
                               regime: Optional[str] = None) -> bool:
-        if self._open_record is None:
-            return False
+        """Manage every open position this tick. Normally one; for a legged
+        condor there can be two verticals open at once, each managed
+        independently (a tested side exits on its own; the untested side
+        stays)."""
+        if not self._open_records:
+            self._open_records = self._trade_logger.get_open_trades()
+            if not self._open_records:
+                return False
 
-        record   = self._open_record
+        still_open: List[TradeRecord] = []
+        for record in list(self._open_records):
+            if self._manage_one(record, df_1m, chain, regime):
+                still_open.append(record)
+        self._open_records = still_open
+        return len(self._open_records) > 0
+
+    def _manage_one(self, record: TradeRecord,
+                    df_1m: Optional[pd.DataFrame],
+                    chain, regime: Optional[str]) -> bool:
+        """Manage one record. Returns True if it should remain open."""
         trade_id = record["trade_id"]
 
         current_premium = self._fetch_current_premium(record, chain)
@@ -79,7 +109,8 @@ class PositionManager:
             record["stop_premium"] = decision.new_trail_stop
 
         if decision.should_exit:
-            return self._execute_exit(record, decision, current_premium)
+            closed = self._execute_exit(record, decision, current_premium)
+            return not closed   # drop if closed; keep (retry) if the order failed
 
         logger.debug(
             f"Position [{trade_id[:8]}]: "
@@ -104,7 +135,14 @@ class PositionManager:
                 side           = record.get("option_side", "call")
                 contracts_list = chain.calls if side == "call" else chain.puts
 
-                if is_butterfly:
+                if record.get("is_condor_leg") or record.get("strategy") == "IronCondorStrategy":
+                    short_s = record.get("short_strike", 0)
+                    long_s  = record.get("long_strike",  0)
+                    short_m = next((c.mark for c in contracts_list if c.strike == short_s and c.mark > 0), None)
+                    long_m  = next((c.mark for c in contracts_list if c.strike == long_s  and c.mark > 0), None)
+                    if short_m is not None and long_m is not None:
+                        return short_m - long_m   # current spread value (credit basis)
+                elif is_butterfly:
                     lower_s  = record.get("lower_strike",  0)
                     center_s = record.get("center_strike", 0)
                     upper_s  = record.get("upper_strike",  0)
@@ -166,6 +204,8 @@ class PositionManager:
     def _execute_exit(self, record: TradeRecord,
                        decision: ExitDecision,
                        current_premium: float) -> bool:
+        """Place the exit, log/alert, record win/loss. Returns True if the
+        position closed, False if the order failed (caller retries)."""
         trade_id = record["trade_id"]
 
         exit_eng = get_exit_engine(self.paper_trading)
@@ -173,11 +213,18 @@ class PositionManager:
 
         if not success:
             logger.error(f"Exit order failed for {trade_id[:8]} — will retry next tick")
-            return True
+            return False
 
         entry_prem    = record["entry_premium"]
         contracts     = record["contracts"]
-        pnl_per_share = current_premium - entry_prem
+        # Credit spreads (condor legs) profit when the spread value FALLS, so the
+        # P&L sign is inverted vs a debit trade.
+        is_condor_leg = (bool(record.get("is_condor_leg"))
+                         or record.get("strategy") == "IronCondorStrategy")
+        if is_condor_leg:
+            pnl_per_share = entry_prem - current_premium
+        else:
+            pnl_per_share = current_premium - entry_prem
         pnl_usd       = pnl_per_share * contracts * CONTRACT_MULTIPLIER
 
         self._trade_logger.log_exit(
@@ -215,15 +262,13 @@ class PositionManager:
             except Exception as e:
                 logger.warning(f"Could not re-arm ORB engine: {e}")
 
-        self._open_record = None
-
         logger.info(
             f"✅ Position closed: {trade_id[:8]} "
             f"exit=${current_premium:.2f} "
             f"pnl=${pnl_usd:+.2f} "
             f"reason={decision.exit_reason}"
         )
-        return False
+        return True
 
 
 # Singleton

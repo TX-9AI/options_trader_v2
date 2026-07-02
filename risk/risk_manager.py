@@ -3,6 +3,9 @@ risk/risk_manager.py — Position sizing and session circuit breaker.
 v1.0 — original release
 v1.1 — 2026-06-27 — remove TRADE_GRADE_C and Twilio references,
         clean up Grade C sizing logic
+v1.3 — 2026-07-02 — add compute_condor_leg_size(): sizes ONE condor vertical
+        at HALF the grade budget (each side gets half), against the spread
+        max-loss = (width - credit) x 100. Enables two independent verticals.
 v1.2 — 2026-07-02 — session loss limit no longer halts the session. Hitting
         SESSION_LOSS_LIMIT now REQUESTS a regime reassessment (consumed by the
         main loop) instead of stopping the service. Rationale: a 2-loss count
@@ -142,6 +145,48 @@ class RiskManager:
             f"= ${total_cost:.2f} total "
             f"grade={grade} mult={grade_mult}x "
             f"{'[BUTTERFLY HALF-SIZE]' if is_butterfly and butterfly_half_size else ''}"
+        )
+        return result
+
+    def compute_condor_leg_size(self, spread_width: float, credit: float,
+                                 grade: str = "B") -> SizingResult:
+        """Size ONE condor vertical (credit spread) at HALF the grade budget.
+
+        Each side of the condor is budgeted independently at half of the normal
+        per-trade risk, so a B-grade $1000 trade becomes two $500 verticals.
+        Max loss per contract for a credit spread = (width - credit) x 100.
+        """
+        result = SizingResult(grade=grade)
+
+        max_loss_per_contract = (spread_width - credit) * CONTRACT_MULTIPLIER
+        if max_loss_per_contract <= 0:
+            result.allowed       = False
+            result.reject_reason = "non_positive_max_loss (credit >= width)"
+            return result
+
+        grade_mult  = GRADE_SIZE_MULTIPLIER.get(grade, 1.0)
+        half_budget = self._risk_per_trade * grade_mult * 0.5
+
+        count = int(half_budget // max_loss_per_contract)
+        if count < 1:
+            result.allowed       = False
+            result.reject_reason = (
+                f"insufficient_capital: vertical max_loss="
+                f"${max_loss_per_contract:.0f} > half_budget=${half_budget:.0f}"
+            )
+            return result
+
+        result.contracts        = count
+        result.cost_per_contract = max_loss_per_contract
+        result.total_cost       = count * max_loss_per_contract
+        result.max_loss         = count * max_loss_per_contract
+        result.grade_multiplier = grade_mult
+        result.allowed          = True
+
+        logger.info(
+            f"Condor leg size: {count} vertical(s) x max_loss "
+            f"${max_loss_per_contract:.0f} = ${result.total_cost:.0f} "
+            f"(half budget=${half_budget:.0f}, grade={grade})"
         )
         return result
 

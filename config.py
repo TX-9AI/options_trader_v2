@@ -1,11 +1,14 @@
 """
-config.py — options_trader v1.2
+config.py — options_trader v1.3
 v1.0 — original release
 v1.1 — 2026-06-27 — remove Twilio, fix SWEEP_TARGET_DELTA to 0.08,
         remove Grade C, add BUTTERFLY_ENTRY_CUTOFF_ET
 v1.2 — 2026-06-29 — butterfly overhaul: fixed wings by instrument,
         GEX pin proximity gate (1x expected move), noon-2PM entry window,
         one-per-session limit, TP reduced to 20%
+v1.3 — 2026-07-02 — narrow SPX condor wings 25->5 so each vertical is
+        affordable (max loss ~$235/contract), enabling half-budget-per-side
+        condor sizing.
 
 All secrets come from environment variables — never from hardcoded values
 or editable files. The setup_ec2.sh script writes them into the systemd
@@ -130,7 +133,7 @@ BUTTERFLY_GEX_PIN_PROXIMITY_MULT = 1.0  # Multiplier on expected move
 
 CONDOR_SHORT_DELTA          = 0.22   # Target delta for short strikes
 CONDOR_DELTA_TOLERANCE      = 0.05   # Acceptable deviation from target delta
-CONDOR_WING_WIDTH_SPX       = 25     # Fixed wing width in points on SPX
+CONDOR_WING_WIDTH_SPX       = 5      # Narrow wings — affordable verticals (was 25)
 CONDOR_WING_WIDTH_QQQ       = 5      # Fixed wing width in points on QQQ/SPY
 CONDOR_EXPECTED_MOVE_GUARDRAIL_MULT = 1.2  # Short strikes must be within this x EM
 CONDOR_PROXIMITY_STRIKES    = 2      # Strikes inside the short strike that trigger entry

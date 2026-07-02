@@ -13,6 +13,10 @@ v2.4 — 2026-07-02 — remove duplicate _execute_condor_leg (dead 2-arg def sha
         and the startup fetch is gated to >= 9:35 ET so it never writes a
         stale prior-day range; instrument read from OT_INSTRUMENT (no systemd
         unit-file parsing).
+v2.7 — 2026-07-02 — condor legs are now TRACKED positions: each vertical is
+        sized at half the grade budget, written to the trade log, registered
+        with the position manager (the only two-position strategy), and
+        managed/exited per-side. Replaces the phantom notify-only path.
 v2.6 — 2026-07-02 — session loss limit forces a regime reassessment instead of
         halting: main_loop consumes RiskManager.consume_reassess_request() and
         reclassifies with trigger="loss_limit".
@@ -234,7 +238,10 @@ def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
     Paper mode: fills at mid credit. Live mode: places the 2-leg vertical as a
     single CREDIT limit order via TastyTrade (same SDK pattern as entry_engine).
     """
-    from config import CONTRACT_MULTIPLIER, CONDOR_NICKEL_CLOSE
+    from config import (CONTRACT_MULTIPLIER, CONDOR_NICKEL_CLOSE,
+                        CONDOR_STOP_LOSS_PCT, INSTRUMENT)
+    from database.trade_logger import make_record, get_trade_logger
+    import uuid
 
     mode = "PAPER" if state.paper_trading else "LIVE"
 
@@ -250,13 +257,19 @@ def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
         logger.error("Condor leg: missing contracts — cannot execute")
         return
 
-    net_credit = signal.net_credit
-    contracts  = 1  # One vertical per leg. TODO: size via risk manager.
+    net_credit   = signal.net_credit
+    spread_width = abs(short_contract.strike - long_contract.strike)
+
+    # Size this vertical at HALF the grade budget — each side is independent,
+    # so a B-grade $1000 trade becomes two ~$500 verticals.
+    sizing = get_risk_manager().compute_condor_leg_size(spread_width, net_credit, "B")
+    if not sizing.allowed:
+        logger.info(f"Condor leg not sized: {sizing.reject_reason}")
+        return
+    contracts = sizing.contracts
 
     if not state.paper_trading:
-        # Live 2-leg vertical credit order. NOTE: the condor live path has not
-        # been exercised with real capital yet — dry-run test before the first
-        # live session. Mirrors entry_engine's NewOrder/Leg/place_order usage.
+        # Live 2-leg vertical credit order. NOTE: dry-run test before first live use.
         try:
             from data.tasty_client import get_session, get_account
             from tastytrade.order import (
@@ -287,17 +300,57 @@ def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
                 logger.error(f"Condor leg order failed: {response.errors}")
                 return
             fill_credit = float(getattr(response.order, "price", None) or net_credit)
+            order_id    = str(getattr(response.order, "id", "") or "")
         except Exception as e:
             logger.error(f"Condor leg order failed: {e}")
             return
     else:
-        # Paper: fill at mid credit.
-        fill_credit = net_credit
+        fill_credit = net_credit    # paper: fill at mid credit
+        order_id    = "PAPER"
 
-    # Record the fill against the plan (advances DECIDED -> LEG1_FILLED ->
-    # COMPLETE) and notify — identical for paper and live.
-    total_credit = fill_credit * contracts * CONTRACT_MULTIPLIER
-    is_leg1 = "Leg 1" in signal.setup_type
+    is_leg1  = "Leg 1" in signal.setup_type
+    max_loss = (spread_width - fill_credit) * contracts * CONTRACT_MULTIPLIER
+
+    # Register the leg as a TRACKED position so it is managed, exited, and P&L'd.
+    # The condor is the ONLY strategy allowed a second concurrent position.
+    record = make_record(
+        trade_id         = str(uuid.uuid4()),
+        symbol           = INSTRUMENT,
+        strategy         = "IronCondorStrategy",
+        setup_type       = signal.setup_type,
+        setup_grade      = "B",
+        direction        = "neutral",
+        option_side      = signal.option_side,
+        is_butterfly     = 0,
+        strike           = short_contract.strike,
+        short_strike     = short_contract.strike,
+        long_strike      = long_contract.strike,
+        spread_width     = spread_width,
+        credit_received  = fill_credit,
+        expiry           = getattr(short_contract, "expiry", ""),
+        contracts        = contracts,
+        entry_premium    = fill_credit,                # credit basis for exits
+        total_cost       = max_loss,
+        max_loss         = max_loss,
+        stop_premium     = fill_credit * (1 + CONDOR_STOP_LOSS_PCT),
+        target_premium   = CONDOR_NICKEL_CLOSE,
+        underlying_entry = getattr(signal, "underlying_entry", 0.0),
+        regime           = "RANGING",
+        vix_at_entry     = getattr(signal, "vix_at_signal", 0.0),
+        is_condor_leg    = 1,
+        condor_leg_num   = 1 if is_leg1 else 2,
+        is_broken_wing   = 0,
+        short_symbol     = getattr(short_contract, "symbol", ""),
+        long_symbol      = getattr(long_contract, "symbol", ""),
+        option_symbol    = getattr(short_contract, "symbol", ""),
+        order_id         = order_id,
+        paper_trade      = 1 if state.paper_trading else 0,
+        status           = "open",
+    )
+    get_trade_logger().log_entry(record)
+    get_position_manager(state.paper_trading).add_condor_leg(record)
+
+    # Advance the plan (DECIDED -> LEG1_FILLED -> COMPLETE).
     _iron_condor_strategy.notify_leg_filled(
         is_leg1        = is_leg1,
         credit         = fill_credit,
@@ -308,16 +361,16 @@ def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
     get_alert_manager()._send(
         f"\U0001F985 [{mode}] {signal.setup_type} | "
         f"sell={short_contract.strike:.0f} buy={long_contract.strike:.0f} "
-        f"credit=${fill_credit:.2f} | "
-        f"stop=${fill_credit * (1 + signal.stop_loss_pct):.2f} | "
-        f"nickel=${CONDOR_NICKEL_CLOSE:.2f} | "
+        f"x{contracts} credit=${fill_credit:.2f} | "
+        f"stop=${fill_credit * (1 + CONDOR_STOP_LOSS_PCT):.2f} | "
+        f"nickel=${CONDOR_NICKEL_CLOSE:.2f} | maxloss=${max_loss:.0f} | "
         f"{fmt_et_short()}"
     )
 
     logger.info(
-        f"[{mode}] CONDOR LEG EXECUTED: {signal.setup_type} "
+        f"[{mode}] CONDOR LEG EXECUTED (tracked): {signal.setup_type} "
         f"short={short_contract.strike:.0f} long={long_contract.strike:.0f} "
-        f"credit=${fill_credit:.2f} total=${total_credit:.2f}"
+        f"x{contracts} credit=${fill_credit:.2f} max_loss=${max_loss:.0f}"
     )
 
 

@@ -9,6 +9,11 @@ v1.3 — 2026-07-01 — ORB range now read from orb_range.json (written by
 v1.4 — 2026-07-02 — fix _range_date comparison: now stored as string from
         JSON date field so today check works correctly and engine stops
         reloading orb_range.json every tick after range is set.
+v1.6 — 2026-07-02 — 11:00 ET HARD cutoff (expire even awaiting-retest, so the
+        bot moves to other regimes after 11:00) + two explicit invalidation
+        rules: (a) price runs to the 50% TP with no retest (runaway breakout,
+        favors sweep reversal); (b) a 1m candle closes back inside the ORB
+        range. Replaces the 2PM/exempt-retest behavior.
 v1.5 — 2026-07-02 — honor the orb_range.json "status" field. Only an
         ESTABLISHED range dated today is loaded and armed (WAITING->RANGING).
         EXPIRED (last RTH) and IN_PROGRESS (opening candle still forming)
@@ -27,7 +32,8 @@ import pandas as pd
 from utils.time_utils import now_et, is_past_entry_cutoff
 from utils.math_utils import orb_strike_selection
 from config import (
-    ORB_BREAK_BUFFER, ORB_MAX_RETEST_BARS, STRIKE_INCREMENT, INSTRUMENT
+    ORB_BREAK_BUFFER, ORB_MAX_RETEST_BARS, STRIKE_INCREMENT, INSTRUMENT,
+    NO_ENTRY_AFTER_ET
 )
 
 logger = logging.getLogger(__name__)
@@ -147,30 +153,31 @@ class ORBEngine:
         if self._range_date != today or d.orb_high == 0.0:
             self._load_range_from_file()
 
-        past_cutoff = is_past_entry_cutoff()
-        d.entries_expired = past_cutoff
+        now = now_et()
+        past_orb_cutoff = (now.hour, now.minute) >= NO_ENTRY_AFTER_ET
+        d.entries_expired = past_orb_cutoff
 
-        if past_cutoff and d.state not in (
-            ORBState.BREAK_HIGH_AWAITING_RETEST, ORBState.BREAK_LOW_AWAITING_RETEST
-        ):
+        # 11:00 ET HARD cutoff — the ORB window is over. Expire regardless of
+        # state (including awaiting-retest), so the bot moves on to other
+        # regimes (sweep reversal, condor, butterfly). A confirmed OPEN position
+        # returned early above and is untouched (it exits on its own rules).
+        if past_orb_cutoff:
             if d.state != ORBState.EXPIRED:
                 d.state = ORBState.EXPIRED
                 logger.info(
-                    f"ORB: past entry cutoff — EXPIRED "
+                    f"ORB: past 11:00 ET cutoff — EXPIRED "
                     f"(range: {d.orb_low:.2f}-{d.orb_high:.2f})"
                 )
             return d
 
-        if d.state == ORBState.RANGING and not past_cutoff:
+        if d.state == ORBState.RANGING:
             self._check_for_break(df_1m)
 
         if d.state in (ORBState.BREAK_HIGH_AWAITING_RETEST, ORBState.BREAK_LOW_AWAITING_RETEST):
             self._check_for_retest(df_1m)
 
-        if d.state == ORBState.INVALIDATED and not past_cutoff:
+        if d.state == ORBState.INVALIDATED:
             self._rearm()
-        elif d.state == ORBState.INVALIDATED and past_cutoff:
-            d.state = ORBState.EXPIRED
 
         return d
 
@@ -244,21 +251,40 @@ class ORBEngine:
         body_low  = min(open_, close)
 
         if d.break_direction == "long":
+            # (a) Runaway breakout — ran to the 50% TP with no retest → invalidate.
+            # This is the setup that most favors a sweep reversal instead.
+            if high >= d.target_50pct:
+                d.state = ORBState.INVALIDATED
+                logger.info(
+                    f"ORB INVALIDATED: ran to 50% TP ({d.target_50pct:.2f}) "
+                    f"without retest — runaway breakout (favors sweep reversal)"
+                )
+                return
             if low < d.orb_high and body_low >= d.orb_high * 0.999:
                 d.state        = ORBState.OPEN_LONG
                 d.confirmed_at = str(now_et())
                 logger.info(f"ORB CONFIRMED LONG (attempt #{d.attempt_number}): wick={low:.2f} body_low={body_low:.2f}")
+            # (b) Retrace into range — 1m candle closes back inside the ORB range.
             elif close < d.orb_high:
                 d.state = ORBState.INVALIDATED
-                logger.info(f"ORB INVALIDATED: close={close:.2f} back inside range")
+                logger.info(f"ORB INVALIDATED: 1m close={close:.2f} back inside range")
         else:
+            # (a) Runaway breakout (short) — ran to the 50% TP with no retest.
+            if low <= d.target_50pct:
+                d.state = ORBState.INVALIDATED
+                logger.info(
+                    f"ORB INVALIDATED: ran to 50% TP ({d.target_50pct:.2f}) "
+                    f"without retest — runaway breakout (favors sweep reversal)"
+                )
+                return
             if high > d.orb_low and body_high <= d.orb_low * 1.001:
                 d.state        = ORBState.OPEN_SHORT
                 d.confirmed_at = str(now_et())
                 logger.info(f"ORB CONFIRMED SHORT (attempt #{d.attempt_number}): wick={high:.2f} body_high={body_high:.2f}")
+            # (b) Retrace into range — 1m candle closes back inside the ORB range.
             elif close > d.orb_low:
                 d.state = ORBState.INVALIDATED
-                logger.info(f"ORB INVALIDATED: close={close:.2f} back inside range")
+                logger.info(f"ORB INVALIDATED: 1m close={close:.2f} back inside range")
 
     def mark_triggered(self):
         self.notify_position_closed()

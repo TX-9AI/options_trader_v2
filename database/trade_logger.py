@@ -3,6 +3,9 @@ database/trade_logger.py — Options trade logging (SQLite).
 v1.0 — original release
 v1.1 — 2026-06-27 — add orb_range_high, orb_range_low, current_premium
         columns to schema for ORB exit logic and live P&L display
+v1.2 — 2026-07-02 — condor-leg support: spread columns (short/long strike,
+        credit, width, is_condor_leg, condor_leg_num, is_broken_wing,
+        short/long symbol) + get_open_trades() for concurrent condor legs.
 """
 
 import logging
@@ -67,6 +70,15 @@ class TradeLogger:
         underlying_target REAL,
         orb_range_high    REAL DEFAULT 0.0,
         orb_range_low     REAL DEFAULT 0.0,
+        short_strike      REAL DEFAULT 0.0,
+        long_strike       REAL DEFAULT 0.0,
+        credit_received   REAL DEFAULT 0.0,
+        spread_width      REAL DEFAULT 0.0,
+        is_condor_leg     INTEGER DEFAULT 0,
+        condor_leg_num    INTEGER DEFAULT 0,
+        is_broken_wing    INTEGER DEFAULT 0,
+        short_symbol      TEXT,
+        long_symbol       TEXT,
         pnl_usd           REAL,
         pnl_pct           REAL,
         regime            TEXT,
@@ -118,6 +130,15 @@ class TradeLogger:
             ("current_premium", "REAL DEFAULT 0.0"),
             ("orb_range_high",  "REAL DEFAULT 0.0"),
             ("orb_range_low",   "REAL DEFAULT 0.0"),
+            ("short_strike",    "REAL DEFAULT 0.0"),
+            ("long_strike",     "REAL DEFAULT 0.0"),
+            ("credit_received", "REAL DEFAULT 0.0"),
+            ("spread_width",    "REAL DEFAULT 0.0"),
+            ("is_condor_leg",   "INTEGER DEFAULT 0"),
+            ("condor_leg_num",  "INTEGER DEFAULT 0"),
+            ("is_broken_wing",  "INTEGER DEFAULT 0"),
+            ("short_symbol",    "TEXT"),
+            ("long_symbol",     "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
@@ -196,6 +217,15 @@ class TradeLogger:
         if row:
             return make_record(**dict(row))
         return None
+
+    def get_open_trades(self) -> List[TradeRecord]:
+        """Return ALL open trades (oldest first). Supports concurrent condor
+        legs; every other strategy holds at most one at a time."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE status='open' ORDER BY entry_time ASC"
+            ).fetchall()
+        return [make_record(**dict(r)) for r in rows]
 
     def get_session_losses(self) -> int:
         today = now_utc().strftime("%Y-%m-%d")
