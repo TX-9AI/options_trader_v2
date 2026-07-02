@@ -105,6 +105,7 @@ class BotState:
         self.paper_trading:    bool = PAPER_TRADING
         self.session_reset_done: bool = False   # Reset once per RTH open
         self.orb_reset_done:   bool = False     # ORB reset once per session
+        self.orb_range_fetched_today: bool = False  # ORB range fetch once after 9:35 ET
 
 
 def run_analysis(state: BotState) -> dict:
@@ -513,14 +514,21 @@ def handle_session_reset(state: BotState):
         get_risk_manager().reset_session()
         state.session_reset_done = True
         state.orb_reset_done     = False
+        state.orb_range_fetched_today = False
 
     if not state.orb_reset_done:
-        # Fetch today's fresh 9:30 candle at RTH open — this is the second
-        # and final time get_orb_range.py runs each day (first was at startup).
-        _fetch_orb_range(os.environ.get("OT_INSTRUMENT", INSTRUMENT))
         get_orb_engine().reset_for_session()
         state.orb_reset_done = True
         logger.info("ORB engine reset for new session")
+
+    # Fetch the ORB range only AFTER 9:35 ET when the 9:30-9:35 candle
+    # is fully closed and baked. Fetching at 9:30 returns a degenerate
+    # candle (high == low == 0 width) because the candle is still forming.
+    if not state.orb_range_fetched_today:
+        now_et_dt = datetime.now(ZoneInfo("US/Eastern"))
+        if (now_et_dt.hour, now_et_dt.minute) >= (9, 35):
+            _fetch_orb_range()
+            state.orb_range_fetched_today = True
 
 
 def handle_hard_close(state: BotState):
