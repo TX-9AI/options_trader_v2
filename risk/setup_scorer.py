@@ -7,6 +7,11 @@ v1.1 — 2026-06-30 — eliminated C grade entirely. There is no such thing
         position. This prevents marginal/low-conviction setups from ever
         firing in live trading regardless of available capital.
         Grade determines position size multiplier: A=1.5x, B=1.0x.
+v1.2 — 2026-07-02 — remove duplicate Fed-day boost. is_fed_day was being
+        applied twice on ORB: once in the macro_context dimension (its
+        designated home) and again inside _orb_quality, double-counting the
+        effect and polluting a dimension that measures confluence/regime/
+        liquidity. Fed-day now boosts ORB through macro_context only.
 """
 
 import logging
@@ -229,8 +234,10 @@ class SetupScorer:
         """
         base = min(len(signal.confluence_factors) * 0.2, 0.8)
 
-        if signal.is_fed_day:
-            base = min(base + 0.2, 1.0)
+        # NOTE: Fed-day is intentionally NOT boosted here. It is applied once,
+        # in the macro_context scoring dimension (see score()). Boosting it
+        # again in orb_quality double-counted the effect. orb_quality measures
+        # confluence/regime/liquidity only.
 
         # Rule 1 boost: break through named level is the highest-quality ORB
         if "named level" in " ".join(signal.confluence_factors).lower() and \

@@ -9,6 +9,11 @@ v1.3 — 2026-07-01 — ORB range now read from orb_range.json (written by
 v1.4 — 2026-07-02 — fix _range_date comparison: now stored as string from
         JSON date field so today check works correctly and engine stops
         reloading orb_range.json every tick after range is set.
+v1.5 — 2026-07-02 — honor the orb_range.json "status" field. Only an
+        ESTABLISHED range dated today is loaded and armed (WAITING->RANGING).
+        EXPIRED (last RTH) and IN_PROGRESS (opening candle still forming)
+        ranges are ignored for trading, so the engine can never break out on
+        a carried-over prior-day range.
 """
 
 import json
@@ -92,28 +97,39 @@ class ORBEngine:
         )
 
     def _load_range_from_file(self):
-        """Load ORB range from orb_range.json — the single source of truth."""
+        """Load the ORB range from orb_range.json — single source of truth.
+
+        Only an ESTABLISHED range dated today is armed for trading. EXPIRED
+        (last RTH) and IN_PROGRESS (opening candle forming) states are ignored
+        so the engine never breaks out on a carried-over prior-day range.
+        """
         d = self._data
         try:
             with open(ORB_RANGE_FILE) as f:
                 data = json.load(f)
+            status = str(data.get("status", "")).upper()
+            date   = data.get("date")
+            today  = now_et().strftime("%Y-%m-%d")
+
+            if status != "ESTABLISHED" or date != today:
+                logger.debug(
+                    f"ORB range not established for today "
+                    f"(status={status or 'NONE'} date={date}) — engine waits"
+                )
+                return
+
             high  = float(data["high"])
             low   = float(data["low"])
             width = float(data["width"])
-            date  = data["date"]
             if high > 0 and low > 0:
                 d.orb_high  = high
                 d.orb_low   = low
                 d.orb_width = width
-                from datetime import date as _date_type
-                try:
-                    self._range_date = str(_date_type.fromisoformat(date))
-                except Exception:
-                    self._range_date = date
+                self._range_date = today
                 if d.state == ORBState.WAITING:
                     d.state = ORBState.RANGING
                 logger.info(
-                    f"ORB range set: high={high:.2f} low={low:.2f} "
+                    f"ORB range ESTABLISHED: high={high:.2f} low={low:.2f} "
                     f"width={width:.2f} date={date}"
                 )
         except Exception as e:

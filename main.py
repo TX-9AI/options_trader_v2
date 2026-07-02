@@ -5,6 +5,19 @@ v2.2 — 2026-07-01 — iron condor legged entry, BB-anchored strikes,
         regime-flip exits, ORB range via get_orb_range.py/orb_range.json,
         fed day trading enabled, ORB cutoff 11AM, condor window 11AM-2PM
 v2.3 — 2026-07-02 — fix missing ZoneInfo import causing loop error every tick
+v2.4 — 2026-07-02 — remove duplicate _execute_condor_leg (dead 2-arg def shadowed by
+        a broken 3-arg def that referenced a non-existent CondorLeg class and
+        mark_leg_filled method); single canonical impl on the real OptionsSignal
+        API with live TastyTrade placement ported in. ORB range fetch is now
+        success-keyed (retries until today's 9:30-9:35 candle is really written)
+        and the startup fetch is gated to >= 9:35 ET so it never writes a
+        stale prior-day range; instrument read from OT_INSTRUMENT (no systemd
+        unit-file parsing).
+v2.5 — 2026-07-02 — ORB range is now three-state (ESTABLISHED/IN_PROGRESS/
+        EXPIRED) and always carries the last valid range. Startup fetch runs
+        unconditionally (populates last-valid EXPIRED range pre-open); the
+        open-poll runs from 9:30 ET and latches only when today's range is
+        ESTABLISHED. Flag renamed orb_range_fetched_today -> _established_.
 0DTE options bot: ORB, Sweep Reversal, Butterfly
 RTH only (9:30–16:00 ET), hard close 15:45 ET.
 
@@ -107,7 +120,7 @@ class BotState:
         self.paper_trading:    bool = PAPER_TRADING
         self.session_reset_done: bool = False   # Reset once per RTH open
         self.orb_reset_done:   bool = False     # ORB reset once per session
-        self.orb_range_fetched_today: bool = False  # ORB range fetch once after 9:35 ET
+        self.orb_range_established_today: bool = False  # today's ORB range ESTABLISHED
 
 
 def run_analysis(state: BotState) -> dict:
@@ -205,21 +218,24 @@ def run_regime_classification(ctx: dict, trigger: str, state: BotState) -> Regim
 
 def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
     """
-    Execute a single condor leg (2-leg vertical spread credit order).
-    Bypasses the normal signal/score/size pipeline since condor legs
-    are credit spreads with their own P&L math and sizing logic.
-    Paper mode: simulates fill, records to DB, notifies via Telegram.
-    Live mode: places the vertical spread order via TastyTrade.
+    Execute a single condor leg (one vertical credit spread) from the
+    OptionsSignal produced by IronCondorStrategy.check_leg_triggers().
+
+    Legging model (per strategy design): Leg 1 fires on the side price is
+    moving toward first; Leg 2 is queued and only fires after Leg 1 fills and
+    only while the regime is still RANGING. If the regime flips before Leg 2,
+    the strategy cancels Leg 2 and the filled Leg 1 vertical is managed
+    standalone through normal stop/nickel exits. This function just executes
+    whichever leg the strategy has decided is ready this tick.
+
+    Paper mode: fills at mid credit. Live mode: places the 2-leg vertical as a
+    single CREDIT limit order via TastyTrade (same SDK pattern as entry_engine).
     """
-    import uuid
-    from database.trade_logger import make_record, get_trade_logger
-    from notifications.alert_manager import get_alert_manager
     from config import CONTRACT_MULTIPLIER, CONDOR_NICKEL_CLOSE
 
-    mode     = "PAPER" if state.paper_trading else "LIVE"
-    trade_id = str(uuid.uuid4())
+    mode = "PAPER" if state.paper_trading else "LIVE"
 
-    # Determine the short and long contracts from the signal
+    # Short/long contracts for this leg live on the call- or put-side fields.
     if signal.option_side == "call":
         short_contract = signal.short_call_contract
         long_contract  = signal.long_call_contract
@@ -228,39 +244,69 @@ def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
         long_contract  = signal.long_put_contract
 
     if short_contract is None or long_contract is None:
-        logger.error(f"Condor leg: missing contracts — cannot execute")
+        logger.error("Condor leg: missing contracts — cannot execute")
         return
 
     net_credit = signal.net_credit
-    contracts  = 1  # Default 1 contract — TODO: size via risk manager
+    contracts  = 1  # One vertical per leg. TODO: size via risk manager.
 
-    # In live mode, place the actual 2-leg order via TastyTrade
     if not state.paper_trading:
+        # Live 2-leg vertical credit order. NOTE: the condor live path has not
+        # been exercised with real capital yet — dry-run test before the first
+        # live session. Mirrors entry_engine's NewOrder/Leg/place_order usage.
         try:
-            from execution.entry_engine import get_entry_engine
-            # TODO: implement live condor leg placement in entry_engine
-            logger.warning("Condor live order placement not yet implemented — skipping")
-            return
+            from data.tasty_client import get_session, get_account
+            from tastytrade.order import (
+                NewOrder, Leg, OrderAction, OrderType, OrderTimeInForce,
+                PriceEffect, InstrumentType,
+            )
+            from decimal import Decimal
+
+            session = get_session()
+            account = get_account()
+            legs = [
+                Leg(instrument_type=InstrumentType.EQUITY_OPTION,
+                    symbol=short_contract.symbol,
+                    action=OrderAction.SELL_TO_OPEN, quantity=contracts),
+                Leg(instrument_type=InstrumentType.EQUITY_OPTION,
+                    symbol=long_contract.symbol,
+                    action=OrderAction.BUY_TO_OPEN, quantity=contracts),
+            ]
+            order = NewOrder(
+                time_in_force = OrderTimeInForce.DAY,
+                order_type    = OrderType.LIMIT,
+                price         = Decimal(str(round(net_credit, 2))),
+                price_effect  = PriceEffect.CREDIT,
+                legs          = legs,
+            )
+            response = account.place_order(session, order, dry_run=False)
+            if response.errors:
+                logger.error(f"Condor leg order failed: {response.errors}")
+                return
+            fill_credit = float(getattr(response.order, "price", None) or net_credit)
         except Exception as e:
             logger.error(f"Condor leg order failed: {e}")
             return
+    else:
+        # Paper: fill at mid credit.
+        fill_credit = net_credit
 
-    # Paper mode: simulate fill at mid
-    total_credit = net_credit * contracts * CONTRACT_MULTIPLIER
-
+    # Record the fill against the plan (advances DECIDED -> LEG1_FILLED ->
+    # COMPLETE) and notify — identical for paper and live.
+    total_credit = fill_credit * contracts * CONTRACT_MULTIPLIER
     is_leg1 = "Leg 1" in signal.setup_type
     _iron_condor_strategy.notify_leg_filled(
         is_leg1        = is_leg1,
-        credit         = net_credit,
+        credit         = fill_credit,
         short_contract = short_contract,
-        long_contract  = long_contract
+        long_contract  = long_contract,
     )
 
     get_alert_manager()._send(
         f"\U0001F985 [{mode}] {signal.setup_type} | "
         f"sell={short_contract.strike:.0f} buy={long_contract.strike:.0f} "
-        f"credit=${net_credit:.2f} | "
-        f"stop=${net_credit * (1 + signal.stop_loss_pct):.2f} | "
+        f"credit=${fill_credit:.2f} | "
+        f"stop=${fill_credit * (1 + signal.stop_loss_pct):.2f} | "
         f"nickel=${CONDOR_NICKEL_CLOSE:.2f} | "
         f"{fmt_et_short()}"
     )
@@ -268,7 +314,7 @@ def _execute_condor_leg(signal: "OptionsSignal", state: BotState):
     logger.info(
         f"[{mode}] CONDOR LEG EXECUTED: {signal.setup_type} "
         f"short={short_contract.strike:.0f} long={long_contract.strike:.0f} "
-        f"credit=${net_credit:.2f} total=${total_credit:.2f}"
+        f"credit=${fill_credit:.2f} total=${total_credit:.2f}"
     )
 
 
@@ -429,86 +475,6 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
         )
 
 
-def _execute_condor_leg(leg, state: BotState, chain):
-    """
-    Execute a single condor vertical spread leg (2-leg order).
-    Called when check_triggers() signals a leg is ready to fire.
-    This bypasses the normal signal/score/size flow since condor legs
-    are credit spreads with their own sizing logic (risk = max loss per leg).
-    """
-    from strategy.iron_condor_strategy import CondorLeg
-    from data.tasty_client import get_session, get_account
-    from tastytrade.order import (
-        NewOrder, Leg, OrderAction, OrderType, OrderTimeInForce,
-        PriceEffect, InstrumentType
-    )
-    from decimal import Decimal
-    import uuid
-
-    mode     = "PAPER" if state.paper_trading else "LIVE"
-    trade_id = f"CONDOR-{leg.side.upper()}-{uuid.uuid4().hex[:8].upper()}"
-
-    logger.info(
-        f"[{mode}] CONDOR LEG: {leg.side.upper()} spread "
-        f"{leg.short_strike:.0f}/{leg.long_strike:.0f} "
-        f"credit=${leg.credit:.2f} max_loss=${leg.max_loss:.2f} "
-        f"id={trade_id}"
-    )
-
-    if state.paper_trading:
-        # Paper mode: simulate fill at mid credit
-        _iron_condor_strategy.mark_leg_filled(leg, leg.credit)
-        get_alert_manager()._send(
-            f"\U0001F985 [PAPER] CONDOR {leg.side.upper()} LEG FILLED: "
-            f"{leg.short_strike:.0f}/{leg.long_strike:.0f} "
-            f"credit=${leg.credit:.2f} | "
-            f"{fmt_et_short()}"
-        )
-        return
-
-    # Live execution — 2-leg vertical spread order
-    try:
-        session = get_session()
-        account = get_account()
-
-        if leg.side == "call":
-            sell_sym = leg.short_contract.symbol
-            buy_sym  = leg.long_contract.symbol
-        else:
-            sell_sym = leg.short_contract.symbol
-            buy_sym  = leg.long_contract.symbol
-
-        legs = [
-            Leg(instrument_type=InstrumentType.EQUITY_OPTION,
-                symbol=sell_sym, action=OrderAction.SELL_TO_OPEN, quantity=1),
-            Leg(instrument_type=InstrumentType.EQUITY_OPTION,
-                symbol=buy_sym,  action=OrderAction.BUY_TO_OPEN,  quantity=1),
-        ]
-        order = NewOrder(
-            time_in_force = OrderTimeInForce.DAY,
-            order_type    = OrderType.LIMIT,
-            price         = Decimal(str(round(leg.credit, 2))),
-            price_effect  = PriceEffect.CREDIT,
-            legs          = legs,
-        )
-        response = account.place_order(session, order, dry_run=False)
-        if response.errors:
-            logger.error(f"Condor leg order failed: {response.errors}")
-            return
-
-        fill_credit = float(getattr(response.order, 'price', None) or leg.credit)
-        _iron_condor_strategy.mark_leg_filled(leg, fill_credit)
-        get_alert_manager()._send(
-            f"\U0001F985 CONDOR {leg.side.upper()} LEG FILLED: "
-            f"{leg.short_strike:.0f}/{leg.long_strike:.0f} "
-            f"credit=${fill_credit:.2f} | "
-            f"{fmt_et_short()}"
-        )
-
-    except Exception as e:
-        logger.error(f"Condor leg execution failed: {e}")
-
-
 def handle_session_reset(state: BotState):
     """Reset session-level state at the start of each RTH day."""
     if not state.session_reset_done:
@@ -516,7 +482,7 @@ def handle_session_reset(state: BotState):
         get_risk_manager().reset_session()
         state.session_reset_done = True
         state.orb_reset_done     = False
-        state.orb_range_fetched_today = False
+        state.orb_range_established_today = False
 
     if not state.orb_reset_done:
         get_orb_engine().reset_for_session()
@@ -526,11 +492,14 @@ def handle_session_reset(state: BotState):
     # Fetch the ORB range only AFTER 9:35 ET when the 9:30-9:35 candle
     # is fully closed and baked. Fetching at 9:30 returns a degenerate
     # candle (high == low == 0 width) because the candle is still forming.
-    if not state.orb_range_fetched_today:
+    if not state.orb_range_established_today:
         now_et_dt = datetime.now(ZoneInfo("US/Eastern"))
-        if (now_et_dt.hour, now_et_dt.minute) >= (9, 35):
-            _fetch_orb_range()
-            state.orb_range_fetched_today = True
+        if (now_et_dt.hour, now_et_dt.minute) >= (9, 30):
+            # Poll from the open: 9:30-9:35 writes IN_PROGRESS, then ESTABLISHED
+            # once the candle closes. Latch ONLY on ESTABLISHED (returns True) so
+            # we keep polling across IN_PROGRESS/EXPIRED instead of locking in a
+            # carried-over range for the session.
+            state.orb_range_established_today = _fetch_orb_range()
 
 
 def handle_hard_close(state: BotState):
@@ -732,36 +701,44 @@ def _recover_open_position(state: BotState):
 
 
 
-def _fetch_orb_range(instrument: str = ""):
-    """Fetch and write orb_range.json. Called at startup and at RTH open.
-    Reads the instrument directly from the systemd unit file at call time
-    so it always reflects the live configured value, not a stale env var.
+def _fetch_orb_range(instrument: str = "") -> bool:
+    """Fetch and write orb_range.json via the standalone get_orb_range.py.
+
+    get_orb_range.py is the single source of truth. It ALWAYS writes the last
+    valid range, tagged with one of three states, and returns it via exit code:
+        0 = ESTABLISHED (today's, closed) -> return True
+        2 = IN_PROGRESS (opening candle forming) -> return False (retry)
+        3 = EXPIRED (carrying last RTH range)    -> return False (retry)
+        1 = hard error                            -> return False
+
+    Returns True ONLY when today's range is ESTABLISHED, so callers keep polling
+    across IN_PROGRESS/EXPIRED until today's candle closes — while status.py and
+    the engine always have the last valid range to read in the meantime.
     """
     try:
         import subprocess as _sp
-        import re as _re
-        _unit = "/etc/systemd/system/optionsbot.service"
-        _symbol = instrument or "QQQ"
-        try:
-            with open(_unit) as _f:
-                _unit_text = _f.read()
-            _m = _re.search(r'Environment=OT_INSTRUMENT=(\S+)', _unit_text)
-            if _m:
-                _symbol = _m.group(1)
-        except Exception:
-            pass
-        _install_dir = os.path.expanduser("~/options-trader")
+        _symbol = instrument or os.environ.get("OT_INSTRUMENT", INSTRUMENT)
+        # main.py lives in the install root; the script is a sibling package.
+        _install_dir = os.path.dirname(os.path.abspath(__file__))
         _orb_script = os.path.join(_install_dir, "analysis", "get_orb_range.py")
         _result = _sp.run(
             [sys.executable, _orb_script, _symbol],
             capture_output=True, text=True, timeout=30
         )
         if _result.returncode == 0:
-            logger.info(f"ORB range: {_result.stdout.splitlines()[0]}")
+            _line = _result.stdout.splitlines()[0] if _result.stdout.strip() else ""
+            logger.info(f"ORB range: {_line}")
+            return True
+        if _result.returncode == 2:
+            logger.debug("ORB range: IN_PROGRESS — today's opening candle forming")
+        elif _result.returncode == 3:
+            logger.debug("ORB range: EXPIRED — carrying last RTH range, awaiting today's")
         else:
             logger.warning(f"ORB range fetch failed: {_result.stderr.strip()}")
+        return False
     except Exception as e:
         logger.warning(f"ORB range fetch skipped: {e}")
+        return False
 
 
 def main():
@@ -830,11 +807,16 @@ def main():
     # that position within seconds — not waiting for the first loop cycle.
     _recover_open_position(state)
 
-    # ── Fetch ORB range on every start/restart ───────────────────────────────
-    # Populates orb_range.json immediately so status.py and orb_engine.py
-    # have the correct range from the first tick. Also runs at RTH open
-    # inside handle_session_reset() to get today's fresh candle.
-    _fetch_orb_range(os.environ.get("OT_INSTRUMENT", INSTRUMENT))
+    # ── Fetch ORB range on start/restart ─────────────────────────────────────
+    # Runs unconditionally: get_orb_range.py always writes the last valid range
+    # tagged ESTABLISHED / IN_PROGRESS / EXPIRED, so status.py and the ORB engine
+    # always have a range to read (e.g. Friday's EXPIRED range on a Monday
+    # pre-open restart). It is safe pre-open because the engine only ARMS on an
+    # ESTABLISHED/today range. We latch only when today's range is ESTABLISHED;
+    # otherwise handle_session_reset() keeps polling from the open.
+    state.orb_range_established_today = _fetch_orb_range(
+        os.environ.get("OT_INSTRUMENT", INSTRUMENT)
+    )
 
     logger.info(
         f"OptionsBot ready | "

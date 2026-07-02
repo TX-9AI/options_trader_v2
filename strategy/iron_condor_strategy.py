@@ -2,11 +2,18 @@
 strategy/iron_condor_strategy.py — Legged Iron Condor for RANGING regime.
 v1.0 — 2026-06-30 — initial release (simultaneous entry placeholder)
 v1.1 — 2026-06-30 — full redesign: legged entry via price-triggered verticals.
+v1.2 — 2026-07-02 — docstring/comment cleanup: strike selection is BB-band
+        anchored ONLY (no delta anywhere in the code). Removed stale
+        "delta-primary" / "delta as secondary" / "falls back to delta-primary"
+        wording that contradicted the implementation and the architecture
+        decision. No logic change.
 
 Strategy design:
   At decision time, the bot identifies both vertical spread strike locations
-  using delta-primary selection (target ~0.22 delta short strikes) with an
-  ATM straddle-based expected-move sanity guardrail. No order is placed yet.
+  by anchoring the short strikes to the Bollinger Band boundaries (short call
+  at/just outside the BB upper band, short put at/just outside the BB lower
+  band), with an ATM straddle-based expected-move sanity guardrail. No delta
+  targeting is used. No order is placed yet.
 
   Leg 1 fires when price reaches within CONDOR_PROXIMITY_STRIKES of the
   first side's short strike — whichever side price is moving toward first.
@@ -232,11 +239,12 @@ class IronCondorStrategy(BaseOptionsStrategy):
             logger.debug("Condor: could not compute expected move")
             return None
 
-        # BB-anchored strike selection (primary) with delta as secondary validation.
+        # BB-anchored strike selection — no delta involvement.
         # Short call placed at or just outside the BB upper band — structurally
         # correct for a ranging day since the BB band IS the range boundary.
-        # Short put placed at or just outside the BB lower band.
-        # Falls back to delta-primary if no liquid strike exists outside the band.
+        # Short put placed at or just outside the BB lower band. If no liquid
+        # strike exists near a band, the leg is skipped (return None) — there
+        # is no delta fallback.
         bb_upper = vol_state.bb_upper if vol_state.bb_upper > 0 else current_price + em
         bb_lower = vol_state.bb_lower if vol_state.bb_lower > 0 else current_price - em
 
