@@ -1,0 +1,5 @@
+# Shell scripts: always LF endings so they don't break with a Windows CRLF
+# "bad interpreter" error when edited on another OS. (Executable bit is handled
+# by git index mode + push.sh, not here.)
+*.sh text eol=lf
+*.py text eol=lf

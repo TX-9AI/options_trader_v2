@@ -11,6 +11,10 @@
 #         local repo (root-commit) conflicts with existing GitHub history,
 #         abort any in-progress rebase and prompt to force-push local as the
 #         authoritative version instead of leaving the working tree mid-conflict.
+# v1.4 — 2026-07-02 — normalize the executable bit on all tracked .sh files on
+#         every push (uploading/SCP strips +x, which flips the repo mode to
+#         100644 and makes ./configure.sh "Permission denied" on fresh clones).
+#         Also chmods the local scripts, so running push.sh repairs this server.
 #
 # Pushes local bot changes to GitHub without exposing token in scripts.
 # Token read from systemd service environment or prompted interactively.
@@ -108,6 +112,13 @@ for pattern in "trades.db-shm" "trades.db-wal" "*.db-shm" "*.db-wal"; do
     grep -qF "$pattern" "$GITIGNORE" 2>/dev/null || echo "$pattern" >> "$GITIGNORE"
 done
 
+# ── Keep shell scripts executable ─────────────────────────────────────────────
+# Uploading/SCP'ing a file drops the +x bit; committing it then flips the repo
+# mode to 100644 and a fresh clone lands ./configure.sh non-executable. Repair
+# every tracked .sh locally so it's runnable on THIS server and so the +x mode
+# gets committed below.
+git ls-files '*.sh' | xargs -r chmod +x 2>/dev/null || true
+
 # Determine branch name dynamically (main or master) instead of hardcoding
 BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
 
@@ -124,6 +135,9 @@ if [ "$HAS_CHANGES" = true ]; then
 
     COMMIT_MSG="${1:-$(date '+%Y-%m-%d') — patch update}"
     git add .
+    # Force the executable bit into the index for every tracked .sh, regardless
+    # of core.fileMode — this is what keeps the repo at 100755 permanently.
+    git ls-files '*.sh' | xargs -r git update-index --chmod=+x 2>/dev/null || true
     git commit -m "$COMMIT_MSG"
 else
     echo -e "  ${GREEN}Nothing new to commit — checking if push is still needed.${RESET}"
