@@ -10,7 +10,10 @@
 #   1. cp bootstrap.example.sh bootstrap.sh   # your copy — gitignored
 #   2. Fill in the REPLACE_ME values in bootstrap.sh.
 #   3. scp bootstrap.sh ubuntu@IP:~
-#   4. On the instance:  chmod +x bootstrap.sh && ./bootstrap.sh
+#   4. On the instance:  bash bootstrap.sh
+#      (no chmod needed — `bash <file>` ignores the execute bit that SCP strips.
+#       It re-launches itself in tmux; if SSH drops, reconnect and run
+#       `tmux attach -t deploy` to watch it finish.)
 #
 #   Forked this repo? Point GITHUB_REPO and the install.sh URL below at YOUR fork.
 #
@@ -20,6 +23,19 @@
 # On a failed install it remains so you can re-run — delete it by hand if you
 # abandon the deploy.
 # =============================================================================
+
+# ── Run inside tmux ───────────────────────────────────────────────────────────
+# Re-launch this script inside a tmux session so a dropped SSH connection can't
+# kill a multi-minute install (and can't leave secrets un-shredded). If you get
+# disconnected, reconnect and run:  tmux attach -t deploy
+if [ -z "$TMUX" ]; then
+    command -v tmux >/dev/null 2>&1 || { sudo apt-get update -qq; sudo apt-get install -y -qq tmux; }
+    if command -v tmux >/dev/null 2>&1; then
+        exec tmux new-session -A -s deploy "bash '$(readlink -f "$0")'"
+    else
+        echo "  (tmux unavailable — running directly; keep this session connected)"
+    fi
+fi
 
 # ── Instrument (optional; defaults to QQQ if omitted) ─────────────────────────
 export OT_INSTRUMENT="QQQ"        # QQQ | SPY | SPX | any supported single name
