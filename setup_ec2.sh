@@ -7,6 +7,11 @@
 # v2.2 — 2026-06-27 — git branch -M main on init
 # v2.3 — 2026-06-27 — GitHub token prompt, added to systemd service
 # v2.6 — 2026-07-02 — cleanup deploy dir + install.sh before dropping to shell
+# v2.7 — 2026-07-02 — unattended install: if credentials are already in the env
+#          (from bootstrap.sh) skip all prompts; shred the bootstrap in cleanup;
+#          set git author to the repo owner instead of the ubuntu system user
+# v2.8 — 2026-07-02 — remove the paper-trading and risk prompts entirely. Installs
+#          are ALWAYS paper; risk defaults to \$200. Both set later via configure.sh
 # v2.4 — 2026-06-27 — GitHub repo prompt, token only required if repo provided
 # v2.5 — 2026-06-30 — strip full URL/protocol from GITHUB_REPO input to prevent
 #         doubled "https://github.com/https://github.com/..." remote URLs
@@ -35,8 +40,8 @@ print_step() { echo -e "\n${BOLD}${GREEN}[ $1 ]${RESET} $2"; }
 print_ok()   { echo -e "  ${GREEN}✓${RESET}  $1"; }
 print_info() { echo -e "  ${CYAN}→${RESET}  $1"; }
 print_warn() { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
-ask()        { read -rp "    $1: " "$2"; }
-ask_secret() { read -rsp "    $1 (paste, then ENTER): " "$2"; echo ""; }
+ask()        { local -n __v="$2"; [ -n "$__v" ] || read -rp "    $1: " "$2"; }
+ask_secret() { local -n __v="$2"; [ -n "$__v" ] || { read -rsp "    $1 (paste, then ENTER): " "$2"; echo ""; }; }
 ask_yn()     {
     while true; do
         read -rp "    $1 [y/n]: " yn
@@ -57,28 +62,28 @@ echo "    - TastyTrade Account Number (e.g. 5WT12345)"
 echo "    - Telegram Bot Token & Chat ID"
 echo "    - GitHub Personal Access Token"
 echo ""
-read -rp "  Press ENTER to continue or Ctrl+C to cancel..."
+# ── Unattended install detection ──────────────────────────────────────────────
+# If a bootstrap.sh already exported the credentials into the environment, skip
+# every interactive prompt and install hands-free.
+UNATTENDED=false
+if [ -n "$TT_CLIENT_SECRET" ] && [ -n "$TT_REFRESH_TOKEN" ] && [ -n "$TT_ACCOUNT_NUMBER" ]; then
+    UNATTENDED=true
+    print_ok "Credentials found in environment — unattended install, prompts skipped."
+fi
+
+[ "$UNATTENDED" = true ] || read -rp "  Press ENTER to continue or Ctrl+C to cancel..."
 
 # ─── STEP 1: TRADING MODE ────────────────────────────────────────────────────
 print_step "1/8" "Trading Mode"
 echo ""
-INSTRUMENT="QQQ"
-RISK_USD="200"
+# No prompts here. Installs are ALWAYS paper with sane defaults; risk, mode
+# (paper/live), and instrument are set afterward via configure.sh.
+INSTRUMENT="${OT_INSTRUMENT:-QQQ}"
+RISK_USD="${OT_RISK_USD:-200}"
 PAPER_TRADING="True"
 
-printf "    Paper trading? [Y/n, default=Y]: "; read -r PAPER_INPUT
-PAPER_INPUT="${PAPER_INPUT:-Y}"
-if [[ "$PAPER_INPUT" =~ ^[Nn] ]]; then
-    PAPER_TRADING="False"
-    print_warn "LIVE TRADING — real orders will be sent to TastyTrade"
-else
-    PAPER_TRADING="True"
-    print_ok "Paper mode"
-fi
-
-printf "    Risk per trade USD [200]: "; read -r RISK_INPUT
-RISK_USD="${RISK_INPUT:-200}"
-print_ok "Instrument: QQQ/SPX | Risk: \$${RISK_USD}/trade | Mode: $([ "$PAPER_TRADING" = "True" ] && echo "PAPER" || echo "LIVE")"
+print_ok "Defaults: ${INSTRUMENT} | \$${RISK_USD}/trade | PAPER"
+print_info "Change risk, mode (paper/live), and instrument anytime via configure.sh"
 
 # ─── STEP 2: TASTYTRADE CREDENTIALS ─────────────────────────────────────────
 print_step "2/8" "TastyTrade OAuth Credentials"
@@ -89,7 +94,7 @@ echo -e "  2. New OAuth Application → all scopes → Create → ${BOLD}save Cl
 echo -e "  3. Inside app → New Personal OAuth Grant → all scopes → ${BOLD}save Refresh Token${RESET}"
 echo -e "  4. Account Number is on the main account page (e.g. 5WT12345)"
 echo ""
-read -rp "    Press ENTER when ready..."
+[ "$UNATTENDED" = true ] || read -rp "    Press ENTER when ready..."
 echo ""
 
 while true; do
@@ -134,7 +139,7 @@ echo -e "  Press ENTER to skip."
 echo ""
 GITHUB_REPO=""
 GITHUB_TOKEN=""
-printf "    GitHub repo [ENTER to skip]: "; read -r GITHUB_REPO
+[ "$UNATTENDED" = true ] || { printf "    GitHub repo [ENTER to skip]: "; read -r GITHUB_REPO; }
 
 # ── Normalize GITHUB_REPO: strip protocol, host, trailing .git/slash ─────────
 # Accepts any of:
@@ -255,6 +260,10 @@ if [ ! -d ".git" ]; then
     git branch -M main 2>/dev/null || git checkout -b main 2>/dev/null || true
     if [[ -n "$GITHUB_REPO" ]]; then
         git remote add origin "https://github.com/${GITHUB_REPO}.git"
+        # Author commits as the repo owner (e.g. TX-9AI), not the ubuntu user
+        GH_OWNER="${GITHUB_REPO%%/*}"
+        git config user.name  "$GH_OWNER"
+        git config user.email "${GH_OWNER}@users.noreply.github.com"
         git fetch origin main -q 2>/dev/null || true
         git reset --hard origin/main -q 2>/dev/null || true
         print_ok "Git repo initialized — push.sh ready to use"
@@ -304,6 +313,13 @@ print_info "Cleaning up installation files..."
 
 rm -rf "$DEPLOY_DIR"
 rm -f "$HOME/install.sh"
+# Destroy the one-shot secrets bootstrap now that credentials are baked into the
+# systemd unit. shred first so the plaintext is not trivially recoverable.
+for _secret_file in "$HOME/bootstrap.sh" "$HOME/cred.txt"; do
+    if [ -f "$_secret_file" ]; then
+        command -v shred >/dev/null 2>&1 && shred -u "$_secret_file" 2>/dev/null || rm -f "$_secret_file"
+    fi
+done
 
 print_ok "Cleanup complete."
 

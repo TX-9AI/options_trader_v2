@@ -11,6 +11,8 @@
 #         local repo (root-commit) conflicts with existing GitHub history,
 #         abort any in-progress rebase and prompt to force-push local as the
 #         authoritative version instead of leaving the working tree mid-conflict.
+# v1.5 — 2026-07-02 — set git author to the repo owner (TX-9AI) instead of the
+#         ubuntu system user, so commits are attributed correctly.
 # v1.4 — 2026-07-02 — normalize the executable bit on all tracked .sh files on
 #         every push (uploading/SCP strips +x, which flips the repo mode to
 #         100644 and makes ./configure.sh "Permission denied" on fresh clones).
@@ -90,6 +92,13 @@ echo -e "  Bot dir: ${BOLD}${BOT_DIR}${RESET}"
 echo -e "  Repo:    ${BOLD}https://github.com/TX-9AI/${REPO}${RESET}"
 echo -e "  Service: ${BOLD}${SERVICE}${RESET}"
 echo ""
+
+# ── Author commits as the repo owner, not the ubuntu system user ──────────────
+GH_OWNER=$(echo "$CURRENT_REMOTE" | sed -E 's#.*github\.com[:/]+([^/]+)/.*#\1#')
+if [ -n "$GH_OWNER" ] && [ "$GH_OWNER" != "$CURRENT_REMOTE" ]; then
+    git config user.name  "$GH_OWNER"
+    git config user.email "${GH_OWNER}@users.noreply.github.com"
+fi
 
 # ── Get GitHub token ──────────────────────────────────────────────────────────
 TOKEN=$(sudo systemctl show "$SERVICE" --property=Environment 2>/dev/null \
