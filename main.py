@@ -13,6 +13,8 @@ v2.4 — 2026-07-02 — remove duplicate _execute_condor_leg (dead 2-arg def sha
         and the startup fetch is gated to >= 9:35 ET so it never writes a
         stale prior-day range; instrument read from OT_INSTRUMENT (no systemd
         unit-file parsing).
+v2.9 — 2026-07-02 — block new entries when the daily loss halt is active
+        (day P&L <= -DAILY_LOSS_LIMIT_USD); open positions still exit.
 v2.8 — 2026-07-02 — (2a) ORB-window sweep override: when an ORB signal fires but
         a sweep reversal has higher conviction, take the sweep. (2b) pass the
         current regime into the ORB engine for regime-gated re-arm. (#3) run
@@ -388,6 +390,12 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     entry_eng = get_entry_engine(state.paper_trading)
 
     # ── Session gate ──────────────────────────────────────────────────────────
+    # Daily loss halt: if the day's NET P&L is down by the limit, take no new
+    # trades (open positions keep being managed to exit). Override via configure.sh.
+    if risk_mgr.is_halted():
+        logger.info("Entry blocked: DAILY LOSS LIMIT reached — halted. Override via configure.sh.")
+        return
+
     can_enter, reason = session.can_enter(ctx["macro"])
     if not can_enter:
         logger.debug(f"Entry blocked: {reason}")

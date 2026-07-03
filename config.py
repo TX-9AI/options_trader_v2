@@ -1,5 +1,5 @@
 """
-config.py — options_trader v1.3
+config.py — options_trader v1.4
 v1.0 — original release
 v1.1 — 2026-06-27 — remove Twilio, fix SWEEP_TARGET_DELTA to 0.08,
         remove Grade C, add BUTTERFLY_ENTRY_CUTOFF_ET
@@ -9,6 +9,8 @@ v1.2 — 2026-06-29 — butterfly overhaul: fixed wings by instrument,
 v1.3 — 2026-07-02 — narrow SPX condor wings 25->5 so each vertical is
         affordable (max loss ~$235/contract), enabling half-budget-per-side
         condor sizing.
+v1.4 — 2026-07-02 — add DAILY_LOSS_LIMIT_USD (default = per-trade risk): halts
+        new entries when the day's NET P&L is down by that amount.
 
 All secrets come from environment variables — never from hardcoded values
 or editable files. The setup_ec2.sh script writes them into the systemd
@@ -69,6 +71,9 @@ CONTRACT_MULTIPLIER = 100
 # ─── ACCOUNT & RISK ───────────────────────────────────────────────────────────
 
 RISK_PER_TRADE_USD  = float(os.environ.get("OT_RISK_USD", "200"))
+# Daily loss limit: halt NEW entries when the day's NET realized P&L is down by
+# this much. Defaults to one trade's risk; override via OT_DAILY_LOSS_LIMIT.
+DAILY_LOSS_LIMIT_USD = float(os.environ.get("OT_DAILY_LOSS_LIMIT", str(RISK_PER_TRADE_USD)))
 MAX_LOSS_PCT        = 0.25
 SESSION_LOSS_LIMIT  = 2
 

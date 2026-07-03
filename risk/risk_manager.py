@@ -3,6 +3,11 @@ risk/risk_manager.py — Position sizing and session circuit breaker.
 v1.0 — original release
 v1.1 — 2026-06-27 — remove TRADE_GRADE_C and Twilio references,
         clean up Grade C sizing logic
+v1.4 — 2026-07-02 — (a) regime reassessment after EVERY losing trade (not just
+        at a count threshold). (b) NET daily loss halt: track session net P&L
+        (seeded from today's closed trades so it survives restarts) and halt
+        NEW entries when day P&L <= -DAILY_LOSS_LIMIT_USD. Wins offset losses —
+        a green day keeps trading. Open positions still exit normally.
 v1.3 — 2026-07-02 — add compute_condor_leg_size(): sizes ONE condor vertical
         at HALF the grade budget (each side gets half), against the spread
         max-loss = (width - credit) x 100. Enables two independent verticals.
@@ -34,7 +39,7 @@ from typing import Optional
 
 from config import (
     RISK_PER_TRADE_USD, SESSION_LOSS_LIMIT, GRADE_SIZE_MULTIPLIER,
-    CONTRACT_MULTIPLIER, PAPER_TRADING, INSTRUMENT
+    CONTRACT_MULTIPLIER, PAPER_TRADING, INSTRUMENT, DAILY_LOSS_LIMIT_USD
 )
 from utils.time_utils import fmt_et_short
 from utils.math_utils import contracts_from_risk
@@ -79,8 +84,11 @@ class RiskManager:
         self._risk_per_trade   = risk_per_trade
         self._paper_trading    = paper_trading
         self._session_losses     = 0
-        self._session_halted     = False   # retained for API compat; never set
+        self._session_halted     = False
         self._reassess_requested = False
+        self._session_pnl_usd    = 0.0
+        self._daily_loss_limit   = DAILY_LOSS_LIMIT_USD
+        self._seeded             = False
 
     def update_risk(self, risk_usd: float):
         self._risk_per_trade = risk_usd
@@ -191,40 +199,76 @@ class RiskManager:
         return result
 
     def check_circuit_breaker(self) -> CircuitBreakerState:
-        # No halt semantics anymore — the loss limit triggers a reassessment,
-        # not a stop. Reported state is always non-halted.
+        self._ensure_seeded()
         return CircuitBreakerState(
             session_losses=self._session_losses,
-            session_halted=False,
+            session_halted=self._session_halted,
         )
 
-    def record_loss(self):
+    def _ensure_seeded(self):
+        """Seed session net P&L from today's closed trades so the daily loss
+        halt survives restarts within the same session."""
+        if self._seeded:
+            return
+        self._seeded = True
+        try:
+            from database.trade_logger import get_trade_logger
+            summary = get_trade_logger().today_summary()
+            self._session_pnl_usd = float(summary.get("total_pnl", 0.0) or 0.0)
+            if self._session_pnl_usd <= -self._daily_loss_limit:
+                self._session_halted = True
+        except Exception:
+            pass
+
+    def record_loss(self, pnl_usd: float = 0.0):
+        self._ensure_seeded()
         self._session_losses += 1
+        self._session_pnl_usd += pnl_usd          # negative for a loss
+        # Reassess the regime after EVERY losing trade — a loss is fresh
+        # information about whether the current regime read still holds.
+        self._reassess_requested = True
         logger.warning(
-            f"Session loss #{self._session_losses} recorded "
-            f"(limit={SESSION_LOSS_LIMIT})"
+            f"Session loss #{self._session_losses} (${pnl_usd:+.0f}) — "
+            f"day P&L ${self._session_pnl_usd:+.0f}; forcing regime reassessment"
         )
-        if self._session_losses >= SESSION_LOSS_LIMIT:
-            # Loss limit reached: request a regime reassessment (consumed by
-            # main_loop) — do NOT halt. Each further loss re-requests it, so
-            # the bot keeps re-reading the market rather than quitting a
-            # session that may still be net profitable.
-            self._reassess_requested = True
-            logger.warning(
-                f"⚠ Loss limit reached ({self._session_losses}/"
-                f"{SESSION_LOSS_LIMIT}) — forcing regime reassessment "
-                f"(session NOT halted)."
-            )
+        self._check_daily_loss_limit()
 
-    def record_win(self):
+    def record_win(self, pnl_usd: float = 0.0):
+        self._ensure_seeded()
+        self._session_pnl_usd += pnl_usd
         logger.info(
-            f"Session win recorded "
-            f"(session_losses={self._session_losses})"
+            f"Session win (${pnl_usd:+.0f}) — day P&L ${self._session_pnl_usd:+.0f}"
         )
+
+    def _check_daily_loss_limit(self):
+        """Halt NEW entries when the day's NET P&L is down by the daily loss
+        limit (default = per-trade risk). Wins offset losses, so a green day
+        keeps trading. Open positions keep being managed to exit."""
+        if self._session_halted:
+            return
+        if self._session_pnl_usd <= -self._daily_loss_limit:
+            self._session_halted = True
+            logger.warning(
+                f"\U0001F6D1 DAILY LOSS LIMIT HIT: day P&L "
+                f"${self._session_pnl_usd:+.0f} <= -${self._daily_loss_limit:.0f}. "
+                f"Halting NEW entries. Override via configure.sh."
+            )
+            try:
+                from notifications.alert_manager import get_alert_manager
+                get_alert_manager()._send(
+                    f"\U0001F6D1 DAILY LOSS LIMIT HIT — day P&L "
+                    f"${self._session_pnl_usd:+.0f} (limit ${self._daily_loss_limit:.0f}). "
+                    f"New entries halted. Override via configure.sh."
+                )
+            except Exception:
+                pass
+
+    def is_halted(self) -> bool:
+        self._ensure_seeded()
+        return self._session_halted
 
     def consume_reassess_request(self) -> bool:
-        """Edge-triggered. Returns True once after the loss limit requested a
-        regime reassessment, then clears the request."""
+        """Edge-triggered. True once after a loss requested a reassessment."""
         if self._reassess_requested:
             self._reassess_requested = False
             return True
@@ -234,21 +278,20 @@ class RiskManager:
         self._session_losses     = 0
         self._session_halted     = False
         self._reassess_requested = False
+        self._session_pnl_usd    = 0.0
+        self._seeded             = True   # fresh session starts flat
         logger.info("Risk manager session reset")
 
     @property
     def session_losses(self) -> int:
         return self._session_losses
 
-    @property
-    def is_halted(self) -> bool:
-        return self._session_halted
-
     def status_report(self) -> str:
         return (
             f"risk=${self._risk_per_trade:.0f}/trade "
-            f"session_losses={self._session_losses}/{SESSION_LOSS_LIMIT} "
-            f"(loss-limit -> regime reassessment, no halt)"
+            f"day_pnl=${self._session_pnl_usd:+.0f} "
+            f"daily_limit=${self._daily_loss_limit:.0f} "
+            f"halted={self._session_halted}"
         )
 
 

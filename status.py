@@ -14,6 +14,7 @@ v1.5 — 2026-07-02 — remove early break from log scan so regime is always
 v1.6 — 2026-07-02 — read regime from database (regime_log table) instead
         of log parsing — reliable across restarts and outside RTH.
 v1.7 — 2026-07-02 — fix regime_log query: ORDER BY logged_at not timestamp.
+v1.10 — 2026-07-02 — banner reflects the NET daily loss halt (day P&L <= -limit).
 v1.9 — 2026-07-02 — reword loss-limit banner: the limit now forces a regime
         reassessment (session continues), not a halt.
 v1.8 — 2026-07-02 — consume the orb_range.json "status" field (ESTABLISHED/
@@ -428,9 +429,11 @@ def main():
         worst  = s["worst"]  or 0
         wr     = wins / total * 100 if total else 0
         cb_warning = ""
-        if losses >= SESSION_LOSS_LIMIT:
-            cb_warning = ("  \u26A0  LOSS LIMIT REACHED "
-                          "\u2192 regime reassessment (session continues)")
+        from config import DAILY_LOSS_LIMIT_USD
+        if pnl <= -DAILY_LOSS_LIMIT_USD:
+            cb_warning = (f"  \U0001F6D1  DAILY LOSS LIMIT HIT "
+                          f"(day P&L ${pnl:+.0f} <= -${DAILY_LOSS_LIMIT_USD:.0f}) "
+                          f"\u2192 new entries halted (override via configure.sh)")
         print(f"  Trades:       {total}  ({wins}W / {losses}L)")
         print(f"  Win rate:     {wr:.0f}%")
         print(f"  Net P&L:      {usd(pnl)}")

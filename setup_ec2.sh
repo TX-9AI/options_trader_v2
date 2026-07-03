@@ -6,6 +6,7 @@
 # v2.1 — 2026-06-27 — auto git init on fresh install
 # v2.2 — 2026-06-27 — git branch -M main on init
 # v2.3 — 2026-06-27 — GitHub token prompt, added to systemd service
+# v2.6 — 2026-07-02 — cleanup deploy dir + install.sh before dropping to shell
 # v2.4 — 2026-06-27 — GitHub repo prompt, token only required if repo provided
 # v2.5 — 2026-06-30 — strip full URL/protocol from GITHUB_REPO input to prevent
 #         doubled "https://github.com/https://github.com/..." remote URLs
@@ -297,6 +298,14 @@ else
     echo ""
     journalctl -u ${SERVICE_NAME} -n 20 --no-pager
 fi
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+print_info "Cleaning up installation files..."
+
+rm -rf "$DEPLOY_DIR"
+rm -f "$HOME/install.sh"
+
+print_ok "Cleanup complete."
 
 # Always end in the install dir with venv active
 export PATH="$VENV/bin:$PATH"

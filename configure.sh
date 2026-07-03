@@ -8,6 +8,7 @@
 #  v1.4 — 2026-06-27 — auto restart on exit if changes made, no prompt
 #  v1.5 — 2026-07-01 — wipe trades.db on instrument change (paper mode only);
 #          ORB range auto-fetched for new instrument via get_orb_range.py
+#  v1.6 — 2026-07-02 — add Daily loss cap override menu (OT_DAILY_LOSS_LIMIT)
 #
 #  Run this anytime to view or change bot settings.
 #  Changes take effect on the NEXT bot start — the bot is
@@ -107,6 +108,8 @@ show_config() {
     echo -e "  Bot status:     $(echo -e $status_label)"
     echo -e "  Instrument:     ${BOLD}${instrument:-not set}${RESET}"
     echo -e "  Risk per trade: ${BOLD}\$${risk:-not set}${RESET}"
+    local dll=$(get_env "OT_DAILY_LOSS_LIMIT")
+    echo -e "  Daily loss cap: ${BOLD}\$${dll:-${risk} (default)}${RESET}"
     echo -e "  Trading mode:   $(echo -e $mode_label)"
     echo -e "  TT Account:     ${BOLD}${account:-not set}${RESET}"
     local tg_status
@@ -181,6 +184,38 @@ change_risk() {
             return
         fi
         print_warn "Please enter a positive number (e.g. 200 or 150.50)."
+    done
+}
+
+change_daily_loss() {
+    local current risk
+    current=$(get_env "OT_DAILY_LOSS_LIMIT")
+    risk=$(get_env "OT_RISK_USD")
+    echo ""
+    echo -e "  ${BOLD}Daily loss cap${RESET} — halts NEW entries once the day's NET"
+    echo -e "  P&L is down by this amount. Open trades still exit normally."
+    echo -e "  Default is one trade's risk (\$${risk})."
+    echo -e "  Current: ${BOLD}\$${current:-${risk} (default)}${RESET}"
+    echo ""
+    while true; do
+        read -p "    New cap in \$, 'r' to reset to risk default, ENTER to keep: " input
+        if [[ -z "$input" ]]; then
+            print_info "Unchanged."
+            return
+        fi
+        if [[ "$input" == "r" ]]; then
+            set_env "OT_DAILY_LOSS_LIMIT" "$risk"
+            reload_daemon
+            print_ok "Daily loss cap reset to per-trade risk (\$${risk})."
+            return
+        fi
+        if [[ "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$input > 0" | bc -l) )); then
+            set_env "OT_DAILY_LOSS_LIMIT" "$input"
+            reload_daemon
+            print_ok "Daily loss cap updated to ${BOLD}\$$input${RESET}."
+            return
+        fi
+        print_warn "Enter a positive number, 'r' to reset, or ENTER to keep."
     done
 }
 
@@ -326,9 +361,10 @@ while true; do
     echo -e "  ${BOLD}3.${RESET}  Paper / Live mode   (currently: $([ "$(get_env OT_PAPER_TRADING)" = "False" ] && echo "🔴 LIVE" || echo "📄 PAPER"))"
     echo -e "  ${BOLD}4.${RESET}  Telegram alerts     (chat: $(get_env TELEGRAM_CHAT_ID))"
     echo -e "  ${BOLD}5.${RESET}  TastyTrade credentials"
-    echo -e "  ${BOLD}6.${RESET}  Done"
+    echo -e "  ${BOLD}6.${RESET}  Daily loss cap      (currently: \$$(dll=$(get_env OT_DAILY_LOSS_LIMIT); echo ${dll:-$(get_env OT_RISK_USD)}))"
+    echo -e "  ${BOLD}7.${RESET}  Done"
     echo ""
-    read -p "    Select [1-6]: " menu_choice
+    read -p "    Select [1-7]: " menu_choice
 
     case "$menu_choice" in
         1) change_instrument; CHANGED=true ;;
@@ -336,8 +372,9 @@ while true; do
         3) change_mode;       CHANGED=true ;;
         4) change_telegram;       CHANGED=true ;;
         5) change_tt_credentials; CHANGED=true ;;
-        6) break ;;
-        *) print_warn "Please enter a number between 1 and 6." ;;
+        6) change_daily_loss;     CHANGED=true ;;
+        7) break ;;
+        *) print_warn "Please enter a number between 1 and 7." ;;
     esac
     echo ""
 done

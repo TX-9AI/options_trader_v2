@@ -15,6 +15,8 @@ v1.5 — 2026-07-02 — multi-position support for legged condors: hold up to tw
         invert P&L sign for credit spreads.
 v1.6 — 2026-07-02 — add remove_record() for the broken-wing roll (drops the old
         untested vertical when it is rolled).
+v1.7 — 2026-07-02 — pass realized P&L into record_win/record_loss so the risk
+        manager can track NET daily P&L for the daily loss halt.
 """
 
 import logging
@@ -244,9 +246,9 @@ class PositionManager:
 
         risk_mgr = get_risk_manager()
         if pnl_usd >= 0:
-            risk_mgr.record_win()
+            risk_mgr.record_win(pnl_usd)
         else:
-            risk_mgr.record_loss()
+            risk_mgr.record_loss(pnl_usd)
 
         get_alert_manager().send_exit_alert(
             trade_id      = trade_id,
