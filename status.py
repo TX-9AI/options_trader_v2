@@ -14,14 +14,15 @@ v1.5 — 2026-07-02 — remove early break from log scan so regime is always
 v1.6 — 2026-07-02 — read regime from database (regime_log table) instead
         of log parsing — reliable across restarts and outside RTH.
 v1.7 — 2026-07-02 — fix regime_log query: ORDER BY logged_at not timestamp.
-v1.10 — 2026-07-02 — banner reflects the NET daily loss halt (day P&L <= -limit).
-v1.9 — 2026-07-02 — reword loss-limit banner: the limit now forces a regime
-        reassessment (session continues), not a halt.
 v1.8 — 2026-07-02 — consume the orb_range.json "status" field (ESTABLISHED/
         IN_PROGRESS/EXPIRED) instead of inventing ORB state from the clock.
         Only an ESTABLISHED range dated today is shown as live; EXPIRED and
         IN_PROGRESS ranges are labeled as such with their date, so a carried
         prior-session range can never be shown as "watching for break".
+v1.9 — 2026-07-02 — reword loss-limit banner: the limit now forces a regime
+        reassessment (session continues), not a halt.
+v1.10 — 2026-07-02 — banner reflects the NET daily loss halt (day P&L <= -limit).
+v1.11 — 2026-07-03 — show live Risk per trade ($ from OT_RISK_USD) under Mode.
 
 Run: python status.py
 
@@ -70,6 +71,7 @@ except Exception:
 
 INSTRUMENT    = get_runtime_env("OT_INSTRUMENT", "QQQ")
 PAPER_TRADING = get_runtime_env("OT_PAPER_TRADING", "True") != "False"
+RISK_PER_TRADE = get_runtime_env("OT_RISK_USD", "200")
 
 
 def now_et():
@@ -326,6 +328,11 @@ def main():
     print(f"  \U0001F4CD Instrument:  {INSTRUMENT}")
     mode_icon = "\U0001F4C4" if PAPER_TRADING else "\U0001F534"
     print(f"  {mode_icon} Mode:         {mode_label}")
+    try:
+        _risk_disp = f"{float(RISK_PER_TRADE):.0f}"
+    except Exception:
+        _risk_disp = RISK_PER_TRADE
+    print(f"  \U0001F4B5 Risk:         ${_risk_disp}")
     print()
     sep()
 
