@@ -13,6 +13,8 @@ v2.4 — 2026-07-02 — remove duplicate _execute_condor_leg (dead 2-arg def sha
         and the startup fetch is gated to >= 9:35 ET so it never writes a
         stale prior-day range; instrument read from OT_INSTRUMENT (no systemd
         unit-file parsing).
+v2.10 — 2026-07-02 — directional-only instruments (single names): skip iron
+        condor and butterfly in the dispatch; ORB + sweep only.
 v2.9 — 2026-07-02 — block new entries when the daily loss halt is active
         (day P&L <= -DAILY_LOSS_LIMIT_USD); open positions still exit.
 v2.8 — 2026-07-02 — (2a) ORB-window sweep override: when an ORB signal fires but
@@ -53,7 +55,7 @@ from zoneinfo import ZoneInfo
 from config import (
     POLL_INTERVAL_SECONDS, LOG_LEVEL, LOG_FILE, LOG_ROTATION_MB,
     PAPER_TRADING, RISK_PER_TRADE_USD, SESSION_LOSS_LIMIT,
-    REGIME_REASSESS_MINUTES, INSTRUMENT, SessionConfig
+    REGIME_REASSESS_MINUTES, INSTRUMENT, SessionConfig, DIRECTIONAL_ONLY
 )
 
 
@@ -471,6 +473,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     # than manual trading on a volatile FOMC day. Fed day boosts ORB
     # conviction instead of blocking entries.
     if (signal is None and
+            not DIRECTIONAL_ONLY and
             regime.primary_regime in (Regime.RANGING, Regime.COMPRESSION) and
             macro.butterfly_allowed):
         signal = _butterfly_strategy.generate_signal(
@@ -485,8 +488,10 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
 
     # Priority 4: Iron Condor — legged entry, RANGING fallback when no GEX pin.
     if not _iron_condor_strategy.has_active_plan:
-        # Try to make a condor plan if no other signal fired and regime is RANGING
+        # Try to make a condor plan if no other signal fired and regime is RANGING.
+        # Skipped for directional-only instruments (single names).
         if (signal is None and
+                not DIRECTIONAL_ONLY and
                 regime.primary_regime == Regime.RANGING):
             plan = _iron_condor_strategy.decide(
                 regime        = regime,

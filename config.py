@@ -1,5 +1,5 @@
 """
-config.py — options_trader v1.4
+config.py — options_trader v1.5
 v1.0 — original release
 v1.1 — 2026-06-27 — remove Twilio, fix SWEEP_TARGET_DELTA to 0.08,
         remove Grade C, add BUTTERFLY_ENTRY_CUTOFF_ET
@@ -11,6 +11,9 @@ v1.3 — 2026-07-02 — narrow SPX condor wings 25->5 so each vertical is
         condor sizing.
 v1.4 — 2026-07-02 — add DAILY_LOSS_LIMIT_USD (default = per-trade risk): halts
         new entries when the day's NET P&L is down by that amount.
+v1.5 — 2026-07-02 — add single-name instruments (NFLX/META/MU/MSFT/TSLA/AAPL/
+        NVDA/SMCI/ORCL) as DIRECTIONAL-ONLY: ORB + sweep only, no condor/
+        butterfly. Widens paper-trading coverage for data collection.
 
 All secrets come from environment variables — never from hardcoded values
 or editable files. The setup_ec2.sh script writes them into the systemd
@@ -61,11 +64,21 @@ def telegram_configured() -> bool:
 INSTRUMENT          = os.environ.get("OT_INSTRUMENT", "QQQ")
 
 STRIKE_INCREMENTS = {
-    "QQQ": 1,
-    "SPY": 1,
-    "SPX": 5,
+    "QQQ": 1, "SPY": 1, "SPX": 5,
+    # Single names — directional-only. Increments are a sensible per-price-band
+    # starting point; tune per name if the chain rounds to a missing strike.
+    "NFLX": 1, "META": 5, "MU": 5, "MSFT": 5, "TSLA": 5,
+    "AAPL": 5, "NVDA": 1, "SMCI": 1, "ORCL": 1,
 }
 STRIKE_INCREMENT    = STRIKE_INCREMENTS.get(INSTRUMENT, 1)
+
+# Directional-only instruments: ORB + Sweep Reversal only. Iron condor and
+# butterfly are blocked (single names lack the strike density and 0DTE decay
+# those neutral strategies rely on). Indices/ETFs keep the full strategy set.
+DIRECTIONAL_ONLY_INSTRUMENTS = {
+    "NFLX", "META", "MU", "MSFT", "TSLA", "AAPL", "NVDA", "SMCI", "ORCL",
+}
+DIRECTIONAL_ONLY    = INSTRUMENT in DIRECTIONAL_ONLY_INSTRUMENTS
 CONTRACT_MULTIPLIER = 100
 
 # ─── ACCOUNT & RISK ───────────────────────────────────────────────────────────

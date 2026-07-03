@@ -9,6 +9,8 @@
 #  v1.5 — 2026-07-01 — wipe trades.db on instrument change (paper mode only);
 #          ORB range auto-fetched for new instrument via get_orb_range.py
 #  v1.6 — 2026-07-02 — add Daily loss cap override menu (OT_DAILY_LOSS_LIMIT)
+#  v1.7 — 2026-07-02 — add single-name instruments (directional-only) to the
+#          instrument menu for wider paper-trading coverage
 #
 #  Run this anytime to view or change bot settings.
 #  Changes take effect on the NEXT bot start — the bot is
@@ -137,18 +139,33 @@ change_instrument() {
     echo ""
     echo -e "  Current instrument: ${BOLD}${current}${RESET}"
     echo ""
-    echo -e "  ${BOLD}1. QQQ${RESET}  —  Nasdaq-100 ETF   (\$1 strikes)"
-    echo -e "  ${BOLD}2. SPY${RESET}  —  S&P 500 ETF      (\$1 strikes)"
-    echo -e "  ${BOLD}3. SPX${RESET}  —  S&P 500 Index    (\$5 strikes)"
+    echo -e "  ${BOLD}Indices / ETFs${RESET} (full strategy set):"
+    echo -e "  ${BOLD} 1. QQQ${RESET}   —  Nasdaq-100 ETF   (\$1 strikes)"
+    echo -e "  ${BOLD} 2. SPY${RESET}   —  S&P 500 ETF      (\$1 strikes)"
+    echo -e "  ${BOLD} 3. SPX${RESET}   —  S&P 500 Index    (\$5 strikes)"
+    echo ""
+    echo -e "  ${BOLD}Single names${RESET} (directional only — no condor/butterfly):"
+    echo -e "  ${BOLD} 4. NFLX${RESET}    ${BOLD} 5. META${RESET}    ${BOLD} 6. MU${RESET}"
+    echo -e "  ${BOLD} 7. MSFT${RESET}    ${BOLD} 8. TSLA${RESET}    ${BOLD} 9. AAPL${RESET}"
+    echo -e "  ${BOLD}10. NVDA${RESET}    ${BOLD}11. SMCI${RESET}    ${BOLD}12. ORCL${RESET}"
     echo ""
     while true; do
-        read -p "    Select [1/2/3, or ENTER to keep ${current}]: " choice
+        read -p "    Select [1-12, or ENTER to keep ${current}]: " choice
         case "${choice:-0}" in
-            0) print_info "Unchanged: ${current}"; return ;;
-            1) NEW_INST="QQQ"; break ;;
-            2) NEW_INST="SPY"; break ;;
-            3) NEW_INST="SPX"; break ;;
-            *) print_warn "Please enter 1, 2, or 3." ;;
+            0)  print_info "Unchanged: ${current}"; return ;;
+            1)  NEW_INST="QQQ";  break ;;
+            2)  NEW_INST="SPY";  break ;;
+            3)  NEW_INST="SPX";  break ;;
+            4)  NEW_INST="NFLX"; break ;;
+            5)  NEW_INST="META"; break ;;
+            6)  NEW_INST="MU";   break ;;
+            7)  NEW_INST="MSFT"; break ;;
+            8)  NEW_INST="TSLA"; break ;;
+            9)  NEW_INST="AAPL"; break ;;
+            10) NEW_INST="NVDA"; break ;;
+            11) NEW_INST="SMCI"; break ;;
+            12) NEW_INST="ORCL"; break ;;
+            *)  print_warn "Please enter 1-12." ;;
         esac
     done
     set_env "OT_INSTRUMENT"  "$NEW_INST"
