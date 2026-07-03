@@ -1,8 +1,10 @@
-# options_trader v2.2 — Vertigo Capital
+# options_trader v2.3 — Vertigo Capital
 
-**QQQ/SPX 0DTE | TastyTrade | Regime-Aware | GEX-Live | Strategy-Aware Exits | Auto-Sized**
+**QQQ/SPX/SPY 0DTE | TastyTrade | Regime-Aware | GEX-Live | Tracked Legged Condor | Broken-Wing Roll | Net Daily Loss Halt**
 
 Institutional-grade 0DTE options trading bot. Classifies intraday market regime every 15 seconds and deploys the appropriate strategy. GEX (Gamma Exposure) is computed in real time from the live options chain — no external API required. Position sizing is automatic. Supports paper and live trading via TastyTrade SDK.
+
+> **Version note:** v2.3 is a large architectural advance over v2.2 (tracked multi-leg condor, broken-wing roll, net daily-loss halt, rebuilt ORB invalidation model). It is intended to prove out across paper sessions before being promoted to **3.0** as the validated milestone. Treat the condor tracking and the broken-wing roll as new until they have real fills behind them.
 
 ---
 
@@ -12,68 +14,84 @@ Institutional-grade 0DTE options trading bot. Classifies intraday market regime 
 
 ADX is computed from the **5-minute timeframe**, matching the bot's actual trading horizon. Using a slower timeframe (e.g. 1H) causes trend days to misclassify as RANGING for hours after a breakout has already happened.
 
+The classifier is a **priority hierarchy** — sweep → breakout → compression → trending → ranging. The first condition that matches wins, so a genuine liquidity sweep is preferred over an ORB even inside the ORB window.
+
 | Regime | Strategy |
 |--------|----------|
-| TRENDING_BULL / TRENDING_BEAR | ORB long call/put (9:30-11:00 AM) |
-| BREAKOUT_VOLATILE | ORB long call/put (9:30-11:00 AM) |
+| TRENDING_BULL / TRENDING_BEAR | ORB long call/put (9:30–11:00 AM) |
+| BREAKOUT_VOLATILE | ORB long call/put (9:30–11:00 AM) |
 | SWEEP_REVERSAL | SweepReversal (OTM gamma play) |
-| RANGING | Iron Condor (11:00 AM-2:00 PM), Butterfly fallback (12:00-2:00 PM if GEX PINNING) |
-| COMPRESSION | Butterfly (GEX pin-centered, 12:00-2:00 PM) |
+| RANGING | Iron Condor (11:00 AM–2:00 PM), Butterfly fallback (12:00–2:00 PM if GEX PINNING) |
+| COMPRESSION | Butterfly (GEX pin-centered, 12:00–2:00 PM) |
 
-Every regime has a strategy. The bot is designed to find at least one valid trade on nearly all trading days.
+Not every regime guarantees a fill (a trending regime with no confirmed ORB, or a compression regime with no GEX pin, may stand aside), but the bot is designed to find at least one valid trade on nearly all trading days.
 
 ### Strategies
 
 **ORB (Opening Range Breakout)**
-- 5-minute opening range locked at 9:30-9:35 ET
-- Range fetched from historical candle data on every startup — survives restarts and fresh installs at any time of day
-- High-conviction setup that typically forms at the session open, independent of trend direction — triggered strictly by break-and-retest rules, no chasing
-- States: `RANGING` -> `BREAK_HIGH/LOW_AWAITING_RETEST` -> `OPEN_LONG/SHORT`
-- Entry requires retest (wick into the range, body stays outside) — no chasing a breakout that never pulls back
-- Failed breaks re-arm the engine for the next attempt (multiple cracks per session)
-- Single-leg long call or long put — strike selected near the ORB-projected 100% target
-- Past 100% TP: trail tightens to track the nearest unfilled 1-minute FVG — no hard exit at target, position can keep running
-- At 50% TP: trailing stop arms and locks in profit
-- **ORB entries valid until 11:00 AM ET only**
+- 5-minute opening range = the 9:30–9:35 ET candle.
+- **Range is sourced through the bot's own data layer** (`market_data.fetch_candles`) — the identical feed and symbol mapping the rest of the bot trades on (`^SPX` for SPX). It is no longer fetched from a separate symbol, so the opening range always agrees with the bot's price feed.
+- **Three-state range model** written to `orb_range.json`; the file always carries the last valid range and declares its state:
+  - `ESTABLISHED` — today's 9:30–9:35 candle has closed. The only tradeable state.
+  - `IN_PROGRESS` — the clock is inside 9:30:00–9:34:59; today's range is still forming; the file carries the last valid range meanwhile.
+  - `EXPIRED` — pre-open, or today's candle isn't on the feed yet; carries the last RTH range (e.g. Friday's on a Monday pre-open).
+  - The engine only arms on `ESTABLISHED`/today — a carried prior-day range can never be traded.
+- Entry requires a retest (wick into the range, body stays outside) — no chasing a breakout that never pulls back.
+- **Two invalidation rules:**
+  - **(a) Runaway breakout** — price runs to the 50%-TP level with no retest → INVALIDATED. This is the setup that most favors a sweep reversal; the ORB stands aside for it.
+  - **(b) Retrace** — a 1-minute candle closes back inside the ORB range → INVALIDATED.
+- **Regime-gated re-arm:** after a (b) retrace invalidation the engine re-arms and watches for another break **only while the regime is still ORB-friendly (RANGING/COMPRESSION)**. It does **not** re-arm after an (a) runaway (hand-off to sweep) or once the regime has shifted to sweep/trend/breakout. It re-checks each tick, so ORB can come back if the regime returns to friendly before 11:00.
+- **ORB-window sweep override:** when an ORB signal fires but a sweep reversal is setting up with higher conviction, the bot takes the sweep. A breakout-without-retest is exactly when sweep odds spike.
+- Single-leg long call or long put — strike near the ORB-projected 100% target.
+- At 50% TP: trailing stop arms. Past 100% TP: trail tracks the nearest unfilled 1-minute FVG — no hard exit, the position can keep running.
+- **ORB entries valid until 11:00 AM ET — HARD cutoff.** At 11:00 the ORB expires regardless of state (including awaiting-retest), and the bot works the other regimes.
 
 **Sweep Reversal**
-- Detects liquidity sweeps at key levels (PDH/PDL, equal highs/lows, session H/L)
-- OTM options selected by delta targeting (pure gamma play)
-- BOS (Break of Structure) exit on 1-minute chart — candle closes only, no wicks
-- Directional entries cut off at 2:00 PM ET
+- Detects liquidity sweeps at key levels (PDH/PDL, equal highs/lows, session H/L).
+- OTM options selected by delta targeting (pure gamma play).
+- BOS (Break of Structure) exit on the 1-minute chart — candle closes only, no wicks.
+- Directional entries cut off at 2:00 PM ET.
 
-**Iron Condor (Legged Entry)**
-- RANGING regime fallback — fires when no GEX pin is available for a butterfly
-- Strike selection: **Bollinger Band anchored only, no delta**
-  - Short call = lowest liquid strike at or above BB upper band
-  - Short put = highest liquid strike at or below BB lower band
-  - BB bands are the structural range boundaries on a ranging day — the only geometrically correct anchor for a neutral credit spread
-  - Delta deliberately excluded — it is relative to wherever price happens to sit at decision time, not the actual range boundaries
-- Sanity guardrail: short strike distance must be within 1.2x the ATM straddle expected move
-- Wing widths: fixed (25pt SPX, $5 QQQ) from the short strikes
-- **Legged entry**: bot identifies both vertical spread locations at decision time, then waits for price to reach within 2 strikes of each short strike before firing that leg
-  - Leg 1 fires when price approaches the first side's short strike
-  - Leg 2 queues after Leg 1 fills, fires when price approaches the opposite side
-  - If regime flips away from RANGING before a leg fires, that pending leg is cancelled
-  - Already-filled legs are never cancelled — they manage independently
-  - If Leg 2 never fires, Leg 1 runs as a standalone vertical
-- Exit per leg: 25% stop loss OR $0.05 nickel close (cleaner than expiry assignment risk)
-- Regime-flip exit: any non-RANGING regime flip while a leg is open triggers immediate exit
-- **Entry window: 11:00 AM - 2:00 PM ET**
+**Iron Condor (Legged Entry — Tracked)**
+- RANGING regime fallback — fires when no GEX pin is available for a butterfly.
+- **Each vertical is a fully tracked position.** The condor is the **only** strategy allowed to hold two positions at once (its two verticals); every other strategy is single-position. Each leg is managed, exited, and P&L'd independently, using credit-spread math (profit as the spread value falls).
+- **Half-budget-per-side sizing:** each vertical is sized to half the grade budget. A B-grade $1,000 trade → two ~$500 verticals.
+- Strike selection: **Bollinger Band anchored only, no delta.**
+  - Short call = lowest liquid strike at/above the BB upper band.
+  - Short put = highest liquid strike at/below the BB lower band.
+  - Delta deliberately excluded — it is relative to where price sits, not the actual range boundaries.
+- Sanity guardrail: short-strike distance must be within 1.2× the ATM straddle expected move.
+- **Wing widths: narrow — 5 points on SPX, $5 on QQQ/SPY** (max loss ~$235/contract on a 5-wide SPX vertical, which is what makes half-budget sizing affordable).
+- **Legged entry** (`DECIDED → LEG1_FILLED → COMPLETE`): the bot fixes both vertical locations at decision time, fires Leg 1 when price approaches the first short strike, then queues Leg 2 for the opposite side.
+  - If the regime flips away from RANGING before a pending leg fires, that leg is cancelled.
+  - Already-filled legs are never cancelled — they manage independently.
+  - If Leg 2 never fires, Leg 1 runs as a standalone vertical.
+- Exit per leg: 25% stop (spread value at 125% of credit) OR $0.05 nickel close.
+- Regime-flip exit is **direction-aware**: a call spread only exits on TRENDING_BULL/BREAKOUT_VOLATILE (a bearish flip is favorable — hold); a put spread only exits on TRENDING_BEAR/BREAKOUT_VOLATILE.
+- **Entry window: 11:00 AM – 2:00 PM ET.**
+
+**Broken-Wing Roll (Condor Adjustment)** — *new in v2.3*
+- When **both** condor verticals are open and price **tests one side**, the bot can roll the **untested** side toward price into a broken-wing butterfly.
+- The roll fires **only if it makes the tested side risk-free** — i.e. cumulative credit collected covers the tested side's width:
+  ```
+  banked_condor_credit + roll_credit - close_cost  >=  tested_side_width
+  ```
+- The solver pulls live chain marks and takes the **smallest** roll toward price that clears risk-free (least new risk on the rolled side). If no roll achieves risk-free, it doesn't roll — the condor is managed normally.
+- **Final form — the roll is a one-time transformation.** Once rolled, every leg is flagged `is_broken_wing` and the bot never adjusts it again: it locks the untested side's gains, removes loss risk on the tested side, and is managed to exit only (stop / nickel). Roll once, stand it, defend it.
 
 **Debit Butterfly (GEX Pin-Centered)**
-- Fires only in RANGING or COMPRESSION regime, requires GEX environment to be PINNING
-- Center strike = GEX pin strike (not ATM)
-- Entry gated by proximity check: price must be within 1x the session expected move of the pin
-- Fixed wing widths: 25 points on SPX, $5 on QQQ/SPY
-- One butterfly per RTH session
-- Regime-flip exit: exits immediately if regime flips to TRENDING
-- TP: 20% of max profit | SL: 25% of net debit | 2.5hr max hold
-- **Entry window: 12:00 PM - 2:00 PM ET**
+- Fires only in RANGING or COMPRESSION with a PINNING GEX environment.
+- Center strike = GEX pin strike (not ATM).
+- Entry gated by proximity: price within 1× the session expected move of the pin.
+- Fixed wings: 25 points on SPX, $5 on QQQ/SPY.
+- One butterfly per RTH session.
+- Regime-flip exit: exits immediately on a flip to TRENDING.
+- TP: 20% of max profit | SL: 25% of net debit | 2.5 hr max hold.
+- **Entry window: 12:00 PM – 2:00 PM ET.**
 
 ### GEX Integration
 
-Computed live from the TastyTrade options chain every 15 seconds. No external scraping required.
+Computed live from the TastyTrade options chain every 15 seconds. No external scraping.
 
 ```
 call_gex = gamma x open_interest x 100 x spot_price
@@ -81,87 +99,84 @@ put_gex  = gamma x open_interest x 100 x spot_price x -1
 net_gex  = call_gex + put_gex (summed across all strikes)
 ```
 
-Derived levels: call wall, put wall, pin strike, flip strike, GEX environment
-
-GEX informs all strategies:
-- **Butterfly** — centers on pin strike, requires PINNING environment and price proximity
-- **Iron Condor** — not GEX-dependent (by design — it fires specifically when GEX is not PINNING)
-- **Sweep Reversal** — confluence boost when sweep hits call/put wall
-- **ORB** — DAMPENING (x0.75 conviction) or AMPLIFYING (x1.15 conviction)
+Derived levels: call wall, put wall, pin strike, flip strike, GEX environment. GEX centers the butterfly (requires PINNING + proximity), boosts sweep-reversal conviction at walls, and dampens/amplifies ORB conviction. The condor is intentionally not GEX-dependent — it fires specifically when GEX is *not* pinning.
 
 ### Regime-Flip Exits
-
-The bot tracks the current regime on every tick and exits neutral positions when their core assumption breaks:
 
 | Position | Exits on |
 |----------|----------|
 | Butterfly | TRENDING_BULL, TRENDING_BEAR, BREAKOUT_VOLATILE |
-| Iron Condor leg | Any non-RANGING regime |
+| Iron Condor leg | Adverse trend into that side's short strikes (direction-aware) |
 | ORB | Range violation (1m close back inside range) — not regime-based |
 | Sweep Reversal | BOS on 1m structure — not regime-based |
 
 ### Position Sizing (Auto)
 
-Risk per trade configurable in `config.py`
+Risk per trade configurable via `OT_RISK_USD` (`config.py`).
 
-- Grade A = 1.5x base risk | Grade B = 1.0x base risk
+- Grade A = 1.5× base risk | Grade B = 1.0× base risk.
 - **There is no Grade C.** Below-threshold setups return `None` and never fire, regardless of capital.
-- Butterfly sizing halved when VIX in 15-20 zone
+- **Condor verticals are sized at half the grade budget per side** (two ~$500 verticals on a B-grade $1,000 trade).
+- Butterfly sizing halved when VIX is in the 15–20 zone.
+
+### Risk Management — Regime Reassessment & Net Daily Loss Halt
+
+- **Regime reassessment after every losing trade.** A loss is fresh information about whether the current regime read still holds, so each losing exit forces a regime reclassification on the next tick (replaces the old count-based circuit breaker).
+- **Net daily loss halt.** New entries are halted once the **day's NET realized P&L** is down by `DAILY_LOSS_LIMIT_USD` (default = one trade's risk). Wins offset losses — a green day keeps trading no matter how many individual losses stack up; only a genuinely red day (net down by the limit) halts.
+  - The tally is **seeded from the DB on startup**, so the halt survives restarts within the session.
+  - It halts **new entries only** — open positions keep being managed to their exits.
+  - **Override:** raise the cap via `configure.sh` → *Daily loss cap* (option 6), or `r` to reset to the risk default. The bot restarts and re-evaluates against the new cap.
 
 ### Session Windows
 
 | Strategy | Entry Window | Notes |
 |----------|-------------|-------|
-| ORB | 9:30 AM - 11:00 AM ET | After 11 AM, re-arm continues but no new entries |
-| Iron Condor | 11:00 AM - 2:00 PM ET | Takes over when ORB window closes |
-| Butterfly | 12:00 PM - 2:00 PM ET | Narrower window, requires GEX PINNING |
-| Sweep Reversal | RTH - 2:00 PM ET | Fires anytime a sweep is detected |
+| ORB | 9:30 AM – 11:00 AM ET | HARD cutoff at 11:00 — ORB expires, other regimes take over |
+| Iron Condor | 11:00 AM – 2:00 PM ET | Takes over when the ORB window closes |
+| Butterfly | 12:00 PM – 2:00 PM ET | Narrower window, requires GEX PINNING |
+| Sweep Reversal | RTH – 2:00 PM ET | Fires anytime a sweep is detected |
 | Hard close | 3:45 PM ET | All positions |
 | VIX > 20 | Block butterflies | — |
-| Fed day | Block all entries | — |
+| Fed day | **Bot trades Fed days** | `is_fed_day` only boosts ORB conviction — entries are not blocked |
 
 ---
 
 ## Changelog
 
+### v2.3 — 2026-07-02 (→ planned 3.0 once paper-validated)
+- **Iron Condor legs are now tracked positions**: each vertical is written to the trade log, registered with the position manager, sized at half the grade budget, and managed/exited/P&L'd independently. The condor is the only strategy allowed two concurrent positions. (Previously legs were logged but never tracked — no exits, no P&L.)
+- **Broken-wing roll added**: rolls the untested condor side into a BWB when the premium math makes the tested side risk-free (cumulative credit ≥ tested-side width); smallest-roll solver over live chain marks; one-time final adjustment flagged `is_broken_wing` — no further rolls.
+- **Narrow SPX condor wings** 25 → 5 points (max loss ~$235/contract), enabling affordable half-budget-per-side sizing.
+- **ORB range rebuilt as a three-state model** (ESTABLISHED / IN_PROGRESS / EXPIRED); always carries the last valid range; engine arms only on ESTABLISHED/today.
+- **ORB range source unified**: fetched through `market_data.fetch_candles` (same feed/symbol as the bot, `^SPX` not `^GSPC`) — fixes the opening-range mismatch with the bot's price feed and the chart.
+- **ORB 11:00 AM HARD cutoff** — expires even awaiting-retest states so the bot moves to other regimes.
+- **Two ORB invalidation rules**: (a) runaway to the 50% TP without a retest (favors sweep), (b) 1m close back inside the range.
+- **Regime-gated ORB re-arm**: re-arm after a (b) retrace only while the regime is ORB-friendly; stand down after (a) runaway or once the regime flips.
+- **ORB-window sweep override**: take a higher-conviction sweep over the ORB inside the window.
+- **Regime reassessment after every losing trade** (replaces count-based circuit breaker).
+- **Net daily loss halt**: halts new entries when the day's net P&L is down by the daily loss limit (default = per-trade risk, `OT_DAILY_LOSS_LIMIT`); seeded from the DB (survives restarts); override menu in `configure.sh`.
+- **`setup_ec2.sh`**: cleanup of the deploy dir and `install.sh` before dropping to the shell in the install dir with venv active.
+
 ### v2.2 — 2026-06-30 (evening session)
-- **Iron Condor added**: legged entry via price-triggered vertical spreads, RANGING regime fallback when no GEX pin available for butterfly
-- **BB-anchored strike selection**: short strikes placed at/outside Bollinger Band boundaries — no delta involved. Delta is relative to current price, not range structure; BB bands are the correct geometric anchor for a neutral credit spread
-- **Legged entry state machine**: DECIDED -> LEG1_FILLED -> COMPLETE, each leg fires independently when price reaches within 2 strikes of the target short strike
-- **Regime-flip exits**: butterfly exits immediately on TRENDING regime flip; condor leg exits on any non-RANGING flip — the regime at entry is the core assumption of both trades
-- **ORB cutoff moved to 11:00 AM**: tighter ORB window, condor takes over from 11 AM
-- **Condor exit logic**: 25% stop loss per leg, $0.05 nickel close (cleaner than holding to expiry assignment risk)
-- **`structure_analyzer.py` crash fixed**: None-format crash on nearest_resistance/nearest_support when no S/R levels exist early in session — was silently breaking run_analysis() on every tick
-- **`orb_engine.py` range persistence fixed (v2)**: range now set before cutoff check, so restart after 2 PM correctly shows H/L/width + EXPIRED state instead of "Waiting for 9:35"
-- **`check_versions.sh`**: recursive version header and critical-string verification script added to repo
+- Iron Condor added: legged entry via price-triggered vertical spreads, RANGING fallback.
+- BB-anchored strike selection (no delta); legged state machine; regime-flip exits.
+- ORB cutoff moved to 11:00 AM; condor exit logic (25% stop, $0.05 nickel).
+- `structure_analyzer.py` None-format crash fixed; `orb_engine.py` range persistence fixed; `check_versions.sh` added.
 
 ### v2.1 — 2026-06-30
-- ADX fixed: now sourced from 5m timeframe instead of 1H
-- ORB engine rewritten: full state model, re-arms after invalidation or position close
-- ORB range persistence: fetched from historical candles on every startup
-- ORB FVG trail: past 100% TP, trail tightens to nearest unfilled 1m FVG instead of hard-exiting
-- Butterfly overhauled: GEX pin-centered, proximity gate, fixed wings, noon-2PM window, one-per-session
-- Grade C eliminated: below-threshold setups return None
-- status.py rewritten: structured ORB display, No Trade instead of UNKNOWN
-- Telegram alerts reduced to 4 events
-- Graceful shutdown alert via SIGTERM/SIGINT handler
-- push.sh hardened: self-healing remote URLs, diverged history handling
-- setup_ec2.sh: GitHub repo prompt accepts full URL or owner/repo format
+- ADX from 5m; ORB engine rewritten with full state model; ORB range persistence and FVG trail; butterfly overhaul; Grade C eliminated; `status.py` rewritten; Telegram to 4 events; graceful shutdown; `push.sh` hardened.
 
 ### v2.0 — 2026-06-27
-- GEX computed live from TastyTrade options chain
-- Strategy-aware exit routing
-- Telegram alerts replace Twilio SMS
-- configure.sh, snapshot.sh added
+- GEX live from TastyTrade; strategy-aware exit routing; Telegram replaces Twilio; `configure.sh`, `snapshot.sh` added.
 
 ### v1.0 — 2026-06-25
-- Initial release
+- Initial release.
 
 ---
 
 ## Deployment
 
-### Option 1 — Web install (mobile / Terminus / any SSH client)
+### Web install (mobile / Termius / any SSH client)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/TX-9AI/options_trader_v2/main/install.sh -o install.sh && bash install.sh
@@ -171,6 +186,8 @@ Have ready:
 - TastyTrade Client Secret, Refresh Token, Account Number
 - Telegram Bot Token and Chat ID
 - GitHub repo (optional — only the source-of-truth server needs this)
+
+`setup_ec2.sh` cleans up the deploy directory and installer on completion and drops you into `~/options-trader` with the venv active.
 
 ### Multi-server workflow
 
@@ -189,7 +206,7 @@ sudo systemctl restart optionsbot
 
 ### Monitoring
 ```bash
-python status.py          # Live status + ORB H/L/width + GEX pin
+python status.py          # Live status + ORB H/L/width/state + GEX pin + daily-loss banner
 python query.py           # Performance dashboard
 journalctl -u optionsbot -f --no-pager | grep -v "tastytrade\|FEED_DATA\|received"
 ```
@@ -206,19 +223,19 @@ sudo systemctl restart optionsbot
 
 This is the single most common cause of "I pushed the fix but it's still broken."
 
+### Configuration & overrides
+```bash
+bash configure.sh         # Instrument, risk, mode, Telegram, TT creds, DAILY LOSS CAP override
+```
+
 ### Verify all fixes are present
 ```bash
-bash check_versions.sh
+bash check_versions.sh    # Recursive version-header + critical-string checks after a deploy
 ```
-Recursively checks every .py and .sh file's version header and runs 28 critical-string checks. Run after any fresh deploy to confirm all fixes actually landed.
 
-### Push changes to GitHub
+### Push / snapshot
 ```bash
 bash push.sh "your message"
-```
-
-### Snapshot
-```bash
 bash snapshot.sh
 ```
 
@@ -233,11 +250,7 @@ sudo systemctl start optionsbot
 
 ## Telegram Alerts
 
-Exactly 4 events:
-1. Bot started
-2. Bot stopped
-3. Trade entered (includes ticker, strikes, credit/debit, total)
-4. Trade closed (win/loss with P&L)
+Core events: bot started, bot stopped, trade entered, trade closed (P&L), plus broken-wing roll and daily-loss-limit alerts when they fire.
 
 ---
 
@@ -245,47 +258,49 @@ Exactly 4 events:
 
 ```
 options_trader_v2/
-├── main.py                    # Main loop, regime dispatch, GEX, entry/exit
-├── config.py                  # All tunable parameters
-├── status.py                  # Live status (ORB H/L/width, regime, GEX, strategy)
+├── main.py                    # Main loop, regime dispatch, GEX, entry/exit, roll check, daily-loss gate (v2.9)
+├── config.py                  # All tunable parameters incl. DAILY_LOSS_LIMIT_USD (v1.4)
+├── status.py                  # Live status: ORB state, regime, GEX, strategy, daily-loss banner (v1.10)
 ├── query.py                   # Performance dashboard
 ├── check_versions.sh          # Recursive version/fix verification
-├── fix_structure_analyzer.sh  # One-shot patch script (baked into repo now)
 ├── push.sh                    # Git push, self-healing
-├── setup_ec2.sh               # EC2 setup
+├── setup_ec2.sh               # EC2 setup + cleanup (v2.6)
+├── configure.sh               # Settings + daily-loss-cap override (v1.6)
 ├── install.sh                 # Web installer
 ├── snapshot.sh                # Bot state backup
 ├── analysis/
-│   ├── orb_engine.py          # ORB state machine (v1.2)
-│   ├── trend_engine.py        # ADX from 5m (v1.1)
-│   ├── structure_analyzer.py  # FVGs, S/R, swings (v1.1 None-crash fix)
+│   ├── get_orb_range.py       # ORB range fetch — three-state, via bot's own feed (v1.3)
+│   ├── orb_engine.py          # ORB state machine — invalidation rules, regime-gated re-arm (v1.7)
+│   ├── trend_engine.py        # ADX from 5m
+│   ├── structure_analyzer.py  # FVGs, S/R, swings
 │   ├── regime_classifier.py
 │   ├── volatility_engine.py   # BB bands, VWAP, ATR
 │   └── liquidity_mapper.py
 ├── strategy/
 │   ├── orb_strategy.py
 │   ├── butterfly_strategy.py
-│   ├── iron_condor_strategy.py  # NEW v2.2 — legged, BB-anchored
+│   ├── iron_condor_strategy.py  # Legged, BB-anchored
+│   ├── condor_roll.py           # NEW v2.3 — broken-wing roll solver + executor (v1.0)
 │   ├── sweep_reversal_strategy.py
-│   └── base_strategy.py         # Extended with 4-leg condor fields
+│   └── base_strategy.py
 ├── execution/
-│   ├── exit_engine.py         # v1.3 — regime-flip exits for butterfly/condor
+│   ├── exit_engine.py         # Strategy-aware exits, direction-aware condor-leg exits
 │   ├── entry_engine.py
-│   └── position_manager.py    # v1.4 — threads regime to exit engine
+│   └── position_manager.py    # Multi-position condor tracking, credit-spread P&L (v1.7)
 ├── risk/
 │   ├── setup_scorer.py        # A/B only, no Grade C
-│   ├── risk_manager.py
+│   ├── risk_manager.py        # Half-budget condor sizing, reassess-every-loss, net daily-loss halt (v1.4)
 │   └── session_guard.py
 ├── data/
 │   ├── gex_data.py
 │   ├── options_chain.py
-│   ├── market_data.py
+│   ├── market_data.py         # Shared candle/quote feed (source of the ORB range)
 │   ├── data_cache.py
 │   ├── macro_data.py
 │   └── tasty_client.py
-├── database/trade_logger.py
+├── database/trade_logger.py   # Spread columns, get_open_trades(), update_fields() (v1.3)
 ├── notifications/
-│   ├── alert_manager.py       # 4 events only, ticker included
+│   ├── alert_manager.py
 │   └── telegram_sender.py
 └── utils/
     ├── math_utils.py
@@ -309,6 +324,6 @@ tzdata
 
 ## Security
 
-- All credentials stored in systemd environment only — never in source files
-- `.gitignore` excludes `credentials.py` and `*.pem`
-- `snapshot.sh` redacts secrets before archiving
+- All credentials stored in systemd environment only — never in source files.
+- `.gitignore` excludes `credentials.py`, `*.pem`, `orb_range.json`, `orb_state.json`.
+- `snapshot.sh` redacts secrets before archiving.
