@@ -12,6 +12,8 @@
 #          set git author to the repo owner instead of the ubuntu system user
 # v2.8 — 2026-07-02 — remove the paper-trading and risk prompts entirely. Installs
 #          are ALWAYS paper; risk defaults to \$200. Both set later via configure.sh
+# v2.9 — 2026-07-03 — fix unattended installs wiping GITHUB_REPO/GITHUB_TOKEN
+#          before git-init, which left the repo with no 'origin' remote
 # v2.4 — 2026-06-27 — GitHub repo prompt, token only required if repo provided
 # v2.5 — 2026-06-30 — strip full URL/protocol from GITHUB_REPO input to prevent
 #         doubled "https://github.com/https://github.com/..." remote URLs
@@ -137,9 +139,14 @@ echo -e "  Format: TX-9AI/options_trader_v2"
 echo -e "  (Full URLs are also accepted and will be normalized automatically)"
 echo -e "  Press ENTER to skip."
 echo ""
-GITHUB_REPO=""
-GITHUB_TOKEN=""
-[ "$UNATTENDED" = true ] || { printf "    GitHub repo [ENTER to skip]: "; read -r GITHUB_REPO; }
+# In unattended mode, KEEP the GITHUB_REPO / GITHUB_TOKEN the bootstrap exported.
+# Only blank + prompt for them in an interactive install (otherwise we'd wipe the
+# env values and skip `git remote add origin`, leaving the repo with no remote).
+if [ "$UNATTENDED" = false ]; then
+    GITHUB_REPO=""
+    GITHUB_TOKEN=""
+    printf "    GitHub repo [ENTER to skip]: "; read -r GITHUB_REPO
+fi
 
 # ── Normalize GITHUB_REPO: strip protocol, host, trailing .git/slash ─────────
 # Accepts any of:
