@@ -1,5 +1,7 @@
 """
 data/options_chain.py — Options chain data from TastyTrade SDK.
+v1.1 — 2026-07-03 — delta-band sweep selection (caller passes a strength-scaled
+        target delta); ORB nearest-strike snap breaks toward higher/lower delta.
 
 Chain fetching:  get_option_chain(session, symbol) → dict[date, list[Option]]
 Greeks/marks:    DXLinkStreamer subscription for real-time Greeks and quotes
@@ -25,7 +27,7 @@ from tastytrade import DXLinkStreamer
 from data.tasty_client import get_session, get_loop, run_async, TastyClientError
 from config import (
     INSTRUMENT, STRIKE_INCREMENT, CONTRACT_MULTIPLIER,
-    SWEEP_TARGET_DELTA, SWEEP_DELTA_TOLERANCE
+    SWEEP_DELTA_TOLERANCE, ORB_STRIKE_DELTA_BIAS
 )
 from utils.math_utils import round_to_strike, floor_to_strike, ceil_to_strike
 
@@ -283,46 +285,51 @@ class OptionsChainFetcher:
     # ─── Strike Selection ─────────────────────────────────────────────────────
 
     def select_orb_strike(self, chain: OptionsChain, direction: str,
-                           target_strike: int) -> Optional[OptionContract]:
-        """Select the ORB strike nearest to target_strike with liquidity."""
+                           target_strike: int,
+                           delta_bias: str = ORB_STRIKE_DELTA_BIAS
+                           ) -> Optional[OptionContract]:
+        """Nearest liquid strike to target_strike. When strikes bracket the target
+        equally, break toward the higher- (more ITM/participation) or lower-
+        (further OTM) |delta| per delta_bias."""
         contracts = chain.calls if direction == "long" else chain.puts
         candidates = [c for c in contracts if c.mark > 0.05]
         if not candidates:
             logger.warning("No liquid contracts in chain")
             return None
-        best = min(candidates, key=lambda c: abs(c.strike - target_strike))
+        min_dist = min(abs(c.strike - target_strike) for c in candidates)
+        nearest = [c for c in candidates
+                   if abs(c.strike - target_strike) <= min_dist + 1e-6]
+        if len(nearest) == 1:
+            best = nearest[0]
+        elif delta_bias == "lower":
+            best = min(nearest, key=lambda c: abs(c.delta))
+        else:  # "higher" — more ITM / more directional participation
+            best = max(nearest, key=lambda c: abs(c.delta))
         logger.info(
             f"ORB strike: {best.option_type} {best.strike} "
-            f"mark=${best.mark:.2f} delta={best.delta:.3f}"
+            f"mark=${best.mark:.2f} delta={best.delta:.3f} (bias={delta_bias})"
         )
         return best
 
     def select_sweep_strike(self, chain: OptionsChain,
                              direction: str,
-                             target_delta: float = SWEEP_TARGET_DELTA,
+                             target_delta: float,
                              tolerance: float = SWEEP_DELTA_TOLERANCE
                              ) -> Optional[OptionContract]:
-        """Select OTM strike closest to target_delta for sweep reversal."""
-        if direction == "long":
-            candidates = [
-                c for c in chain.calls
-                if c.mark > 0.05 and 0.0 < c.delta <= 0.50
-            ]
-            if not candidates:
-                return None
-            best = min(candidates, key=lambda c: abs(c.delta - target_delta))
-        else:
-            candidates = [
-                c for c in chain.puts
-                if c.mark > 0.05 and -0.50 <= c.delta < 0.0
-            ]
-            if not candidates:
-                return None
-            best = min(candidates, key=lambda c: abs(abs(c.delta) - target_delta))
-
+        """Select the OTM strike whose |delta| is nearest target_delta (the caller
+        scales target_delta by reversal strength). Prefers strikes within
+        +/- tolerance of the target; falls back to the nearest available."""
+        pool = chain.calls if direction == "long" else chain.puts
+        liquid = [c for c in pool if c.mark > 0.05 and 0.0 < abs(c.delta) <= 0.55]
+        if not liquid:
+            return None
+        band = [c for c in liquid if abs(abs(c.delta) - target_delta) <= tolerance]
+        pick_from = band if band else liquid
+        best = min(pick_from, key=lambda c: abs(abs(c.delta) - target_delta))
         logger.info(
             f"Sweep strike: {best.option_type} {best.strike} "
-            f"mark=${best.mark:.2f} delta={best.delta:.3f}"
+            f"mark=${best.mark:.2f} delta={best.delta:.3f} "
+            f"(target={target_delta:.2f}{'' if band else ', band empty->nearest'})"
         )
         return best
 
