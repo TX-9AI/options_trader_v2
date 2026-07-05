@@ -1,5 +1,7 @@
 """
 strategy/sweep_reversal_strategy.py — Post-liquidity-sweep reversal for options.
+v1.1 — 2026-07-03 — OTM target delta scales inversely with reversal strength
+        (regime conviction): strong -> far-OTM low delta, weak -> near-ATM.
 
 Ported from crypto_trader SweepReversalStrategy and adapted for 0DTE options:
 - Same sweep detection (PDH/PDL, equal H/L, session H/L)
@@ -21,7 +23,17 @@ from analysis.liquidity_mapper import LiquidityMap, LiquiditySweep
 from data.options_chain import OptionsChain
 from data.options_chain import get_chain_fetcher
 from data.macro_data import MacroSnapshot
-from config import SWEEP_TARGET_DELTA, SWEEP_MAX_AGE_BARS
+from config import (
+    SWEEP_DELTA_STRONG, SWEEP_DELTA_WEAK, SWEEP_MAX_AGE_BARS,
+)
+
+
+def _sweep_target_delta(conviction: float) -> float:
+    """Scale the OTM target delta INVERSELY with reversal strength: a strong
+    snap-back (conviction -> 1) uses a far-OTM low delta for max leverage; a
+    weak one (conviction -> 0) uses a near-ATM higher delta to participate."""
+    strength = max(0.0, min(1.0, conviction))
+    return SWEEP_DELTA_WEAK - strength * (SWEEP_DELTA_WEAK - SWEEP_DELTA_STRONG)
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -162,7 +174,8 @@ class SweepReversalStrategy(BaseOptionsStrategy):
         signal.conviction = regime.conviction
 
         # ── Strike selection: 0.20 delta OTM call ────────────────────────────
-        contract = get_chain_fetcher().select_sweep_strike(chain, "long", SWEEP_TARGET_DELTA)
+        target_delta = _sweep_target_delta(regime.conviction)
+        contract = get_chain_fetcher().select_sweep_strike(chain, "long", target_delta)
         if contract is None:
             logger.warning("Sweep long: no suitable OTM call found")
             return None
@@ -252,7 +265,8 @@ class SweepReversalStrategy(BaseOptionsStrategy):
         signal.conviction = regime.conviction
 
         # ── Strike selection: 0.20 delta OTM put ─────────────────────────────
-        contract = get_chain_fetcher().select_sweep_strike(chain, "short", SWEEP_TARGET_DELTA)
+        target_delta = _sweep_target_delta(regime.conviction)
+        contract = get_chain_fetcher().select_sweep_strike(chain, "short", target_delta)
         if contract is None:
             logger.warning("Sweep short: no suitable OTM put found")
             return None
