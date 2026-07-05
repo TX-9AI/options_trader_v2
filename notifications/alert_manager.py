@@ -7,6 +7,11 @@ v1.2 — 2026-06-30 — stripped down to exactly 4 essential alerts:
         Removed regime change spam and circuit breaker noise
         (circuit breaker is implied by no further entry alerts —
         operator can check status.py for the reason if curious).
+v1.3 — 2026-07-05 — added send_daily_summary(): a deliberate end-of-day P&L
+        rollup sent at ~15:50 ET BEFORE the control server's shutdown sweep.
+        Fee-adjusted net is the headline number. This is the 5th alert, and
+        it is intentional (once/day, not spam). It is a pure formatter: the
+        caller (the EOD task) computes the summary dict from the trade DB.
 """
 
 import logging
@@ -94,6 +99,66 @@ class AlertManager:
             f"pnl={sign}${pnl_usd:.2f} | "
             f"{fmt_et_short()}"
         )
+
+    # ── 5. End-of-day P&L summary (sent before shutdown sweep) ───────────────
+
+    def send_daily_summary(self, summary: dict):
+        """
+        One deliberate EOD rollup. Called by the 15:50 ET EOD task AFTER
+        positions are closed and orphans rechecked, BEFORE the control server
+        stops the box.
+
+        Expected `summary` keys (all optional; safe defaults applied):
+            instrument : str   (defaults to config.INSTRUMENT)
+            paper      : bool
+            n_trades   : int
+            wins       : int
+            losses     : int
+            gross_pnl  : float   (before fees)
+            fees       : float   (total fees paid, positive number)
+            net_pnl    : float   (gross minus fees — the headline)
+            best       : float   (best single-trade net pnl)
+            worst      : float   (worst single-trade net pnl)
+            orphans    : int     (open/orphaned positions found at EOD; 0 = clean)
+            note       : str     (optional freeform, e.g. 'circuit breaker hit')
+        """
+        instrument = summary.get("instrument", INSTRUMENT)
+        mode       = "PAPER" if summary.get("paper", True) else "LIVE"
+        n          = int(summary.get("n_trades", 0))
+        wins       = int(summary.get("wins", 0))
+        losses     = int(summary.get("losses", 0))
+        gross      = float(summary.get("gross_pnl", 0.0))
+        fees       = float(summary.get("fees", 0.0))
+        net        = float(summary.get("net_pnl", gross - fees))
+        orphans    = int(summary.get("orphans", 0))
+        note       = summary.get("note", "")
+
+        icon = "\u2705" if net >= 0 else "\u274C"
+        net_s   = f"{'+' if net >= 0 else '-'}${abs(net):.2f}"
+        gross_s = f"{'+' if gross >= 0 else '-'}${abs(gross):.2f}"
+
+        lines = [
+            f"\U0001F4CA {instrument} DAILY P&L [{mode}] {icon}",
+            f"Trades: {n}  ({wins}W / {losses}L)",
+            f"Net: {net_s}   (gross {gross_s}, fees -${abs(fees):.2f})",
+        ]
+
+        if n > 0 and ("best" in summary or "worst" in summary):
+            best  = float(summary.get("best", 0.0))
+            worst = float(summary.get("worst", 0.0))
+            lines.append(f"Best {best:+.2f} · Worst {worst:+.2f}")
+
+        # Orphan status is a safety signal — always surface it explicitly.
+        if orphans > 0:
+            lines.append(f"\u26A0\uFE0F {orphans} orphaned position(s) found — CHECK before restart!")
+        else:
+            lines.append("Orphans: none \u2713")
+
+        if note:
+            lines.append(f"_{note}_")
+
+        lines.append(fmt_et_short())
+        self._send("\n".join(lines))
 
     # ── Suppressed — kept as no-ops so existing callers don't break ─────────
 
