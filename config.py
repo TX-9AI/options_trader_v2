@@ -1,5 +1,5 @@
 """
-config.py — options_trader v1.6
+config.py — options_trader v1.7
 v1.0 — original release
 v1.1 — 2026-06-27 — remove Twilio, fix SWEEP_TARGET_DELTA to 0.08,
         remove Grade C, add BUTTERFLY_ENTRY_CUTOFF_ET
@@ -18,6 +18,10 @@ v1.6 — 2026-07-03 — expand the tradeable universe to the full screener list.
         Neutral strategies run ONLY on true-0DTE index products (SPY/QQQ/SPX/
         IWM); every other symbol (single names + weekly-only ETFs) is
         directional-only, derived automatically from FULL_STRATEGY_INSTRUMENTS.
+v1.7 — 2026-07-03 — sweep strike delta now scales with reversal strength
+        (strong->far-OTM, weak->near-ATM); ORB strike snapping breaks toward
+        higher/lower delta; paper fills at the exact bid/ask midpoint (no
+        slippage) — all orders priced at the mark.
 
 All secrets come from environment variables — never from hardcoded values
 or editable files. The setup_ec2.sh script writes them into the systemd
@@ -133,11 +137,18 @@ ORB_MAX_RETEST_BARS         = 12
 ORB_TP_MULTIPLIER           = 1.0
 ORB_TRAIL_ACTIVATION        = 0.50
 FED_DAY_ORB_BOOST           = 0.20
+# When snapping an ORB strike target to the nearest available strike, break
+# toward the "higher" (more ITM / participation) or "lower" (further OTM) delta.
+ORB_STRIKE_DELTA_BIAS       = "higher"
 
 # ─── SWEEP REVERSAL STRATEGY ──────────────────────────────────────────────────
 
-SWEEP_TARGET_DELTA          = 0.08
-SWEEP_DELTA_TOLERANCE       = 0.03
+# Sweep OTM strike delta scales INVERSELY with reversal strength (conviction):
+# a strong snap-back can carry a far-OTM (low-delta) strike ITM for max leverage;
+# a weak move needs a nearer, higher-delta strike to actually participate.
+SWEEP_DELTA_STRONG          = 0.08   # conviction -> 1.0 : far-OTM, max leverage
+SWEEP_DELTA_WEAK            = 0.30   # conviction -> 0.0 : near-ATM, participation
+SWEEP_DELTA_TOLERANCE       = 0.04   # acceptable band around the target delta
 SWEEP_MIN_REJECTION_PCT     = 0.003
 SWEEP_MAX_AGE_BARS          = 8
 
@@ -231,7 +242,7 @@ ORDER_BLOCK_LOOKBACK        = 20
 
 LIMIT_RETRY_SECONDS         = 30
 LIMIT_IMPROVE_TICKS         = 1
-PAPER_FILL_SLIPPAGE_PCT     = 0.01
+PAPER_FILL_SLIPPAGE_PCT     = 0.0    # paper fills at the exact bid/ask midpoint (mark)
 
 # ─── TASTYTRADE API ───────────────────────────────────────────────────────────
 
