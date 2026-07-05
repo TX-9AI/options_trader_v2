@@ -11,6 +11,9 @@
 #  v1.6 — 2026-07-02 — add Daily loss cap override menu (OT_DAILY_LOSS_LIMIT)
 #  v1.7 — 2026-07-02 — add single-name instruments (directional-only) to the
 #          instrument menu for wider paper-trading coverage
+#  v1.8 — 2026-07-03 — instrument picker now types the ticker (validated against
+#          config.STRIKE_INCREMENTS) instead of a numbered menu — scales to the
+#          full screener universe
 #
 #  Run this anytime to view or change bot settings.
 #  Changes take effect on the NEXT bot start — the bot is
@@ -134,39 +137,34 @@ show_config() {
 # ──────────────────────────────────────────────────────────────
 
 change_instrument() {
-    local current
+    local current allowed full choice
     current=$(get_env "OT_INSTRUMENT")
+    # Pull the tradeable universe straight from config.py — single source of truth.
+    allowed=$(cd "$BOT_DIR" && python3 -c "import config; print(' '.join(sorted(config.STRIKE_INCREMENTS)))" 2>/dev/null)
+    full=$(cd "$BOT_DIR" && python3 -c "import config; print(' '.join(sorted(config.FULL_STRATEGY_INSTRUMENTS)))" 2>/dev/null)
+    if [ -z "$allowed" ]; then
+        print_warn "Could not read the symbol list from config.py."
+        return
+    fi
     echo ""
     echo -e "  Current instrument: ${BOLD}${current}${RESET}"
     echo ""
-    echo -e "  ${BOLD}Indices / ETFs${RESET} (full strategy set):"
-    echo -e "  ${BOLD} 1. QQQ${RESET}   —  Nasdaq-100 ETF   (\$1 strikes)"
-    echo -e "  ${BOLD} 2. SPY${RESET}   —  S&P 500 ETF      (\$1 strikes)"
-    echo -e "  ${BOLD} 3. SPX${RESET}   —  S&P 500 Index    (\$5 strikes)"
+    echo -e "  ${BOLD}Full strategy${RESET} (condor/butterfly):  ${full}"
+    echo -e "  ${BOLD}Directional only${RESET} (ORB + sweep):    everything else"
     echo ""
-    echo -e "  ${BOLD}Single names${RESET} (directional only — no condor/butterfly):"
-    echo -e "  ${BOLD} 4. NFLX${RESET}    ${BOLD} 5. META${RESET}    ${BOLD} 6. MU${RESET}"
-    echo -e "  ${BOLD} 7. MSFT${RESET}    ${BOLD} 8. TSLA${RESET}    ${BOLD} 9. AAPL${RESET}"
-    echo -e "  ${BOLD}10. NVDA${RESET}    ${BOLD}11. SMCI${RESET}    ${BOLD}12. ORCL${RESET}"
+    echo -e "  Tradeable symbols:"
+    echo "    ${allowed}"
     echo ""
     while true; do
-        read -p "    Select [1-12, or ENTER to keep ${current}]: " choice
-        case "${choice:-0}" in
-            0)  print_info "Unchanged: ${current}"; return ;;
-            1)  NEW_INST="QQQ";  break ;;
-            2)  NEW_INST="SPY";  break ;;
-            3)  NEW_INST="SPX";  break ;;
-            4)  NEW_INST="NFLX"; break ;;
-            5)  NEW_INST="META"; break ;;
-            6)  NEW_INST="MU";   break ;;
-            7)  NEW_INST="MSFT"; break ;;
-            8)  NEW_INST="TSLA"; break ;;
-            9)  NEW_INST="AAPL"; break ;;
-            10) NEW_INST="NVDA"; break ;;
-            11) NEW_INST="SMCI"; break ;;
-            12) NEW_INST="ORCL"; break ;;
-            *)  print_warn "Please enter 1-12." ;;
-        esac
+        read -p "    Enter ticker [ENTER to keep ${current}]: " choice
+        choice=$(echo "${choice:-$current}" | tr '[:lower:]' '[:upper:]')
+        if [[ "$choice" == "$current" ]]; then
+            print_info "Unchanged: ${current}"; return
+        fi
+        if echo "$allowed" | tr ' ' '\n' | grep -qxF "$choice"; then
+            NEW_INST="$choice"; break
+        fi
+        print_warn "Unknown ticker '${choice}'. Pick one from the list above."
     done
     set_env "OT_INSTRUMENT"  "$NEW_INST"
     set_env "OT_BOT_NAME"    "OptionsTrader-${NEW_INST}"

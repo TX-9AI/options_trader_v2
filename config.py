@@ -1,5 +1,5 @@
 """
-config.py — options_trader v1.5
+config.py — options_trader v1.6
 v1.0 — original release
 v1.1 — 2026-06-27 — remove Twilio, fix SWEEP_TARGET_DELTA to 0.08,
         remove Grade C, add BUTTERFLY_ENTRY_CUTOFF_ET
@@ -14,6 +14,10 @@ v1.4 — 2026-07-02 — add DAILY_LOSS_LIMIT_USD (default = per-trade risk): hal
 v1.5 — 2026-07-02 — add single-name instruments (NFLX/META/MU/MSFT/TSLA/AAPL/
         NVDA/SMCI/ORCL) as DIRECTIONAL-ONLY: ORB + sweep only, no condor/
         butterfly. Widens paper-trading coverage for data collection.
+v1.6 — 2026-07-03 — expand the tradeable universe to the full screener list.
+        Neutral strategies run ONLY on true-0DTE index products (SPY/QQQ/SPX/
+        IWM); every other symbol (single names + weekly-only ETFs) is
+        directional-only, derived automatically from FULL_STRATEGY_INSTRUMENTS.
 
 All secrets come from environment variables — never from hardcoded values
 or editable files. The setup_ec2.sh script writes them into the systemd
@@ -63,22 +67,29 @@ def telegram_configured() -> bool:
 
 INSTRUMENT          = os.environ.get("OT_INSTRUMENT", "QQQ")
 
+# Tradeable universe. Strike increments are a per-price-band starting point;
+# the options chain resolves to the nearest liquid strike, so a slightly-off
+# value is not fatal — tune a name here only if its fills consistently miss.
 STRIKE_INCREMENTS = {
-    "QQQ": 1, "SPY": 1, "SPX": 5,
-    # Single names — directional-only. Increments are a sensible per-price-band
-    # starting point; tune per name if the chain rounds to a missing strike.
-    "NFLX": 1, "META": 5, "MU": 5, "MSFT": 5, "TSLA": 5,
-    "AAPL": 5, "NVDA": 1, "SMCI": 1, "ORCL": 1,
+    # Index products with true 0DTE — full strategy set (condor/butterfly OK)
+    "SPY": 1, "QQQ": 1, "SPX": 5, "IWM": 1,
+    # Weekly-only ETFs — directional only
+    "DIA": 1, "SMH": 1, "TLT": 1, "GLD": 1,
+    # Single names — directional only
+    "AAPL": 5, "MSFT": 5, "META": 5, "MU": 5, "TSLA": 5, "NVDA": 1,
+    "NFLX": 1, "ORCL": 1, "SMCI": 1, "PLTR": 1, "AMD": 1, "AMZN": 1,
+    "GOOGL": 1, "XOM": 1, "CVX": 1, "JPM": 5, "GS": 5, "LLY": 5,
+    "UNH": 5, "AVGO": 5, "CRM": 5, "COST": 5,
 }
 STRIKE_INCREMENT    = STRIKE_INCREMENTS.get(INSTRUMENT, 1)
 
-# Directional-only instruments: ORB + Sweep Reversal only. Iron condor and
-# butterfly are blocked (single names lack the strike density and 0DTE decay
-# those neutral strategies rely on). Indices/ETFs keep the full strategy set.
-DIRECTIONAL_ONLY_INSTRUMENTS = {
-    "NFLX", "META", "MU", "MSFT", "TSLA", "AAPL", "NVDA", "SMCI", "ORCL",
-}
-DIRECTIONAL_ONLY    = INSTRUMENT in DIRECTIONAL_ONLY_INSTRUMENTS
+# Neutral strategies (iron condor, butterfly) require true-0DTE decay and strike
+# density, so they run ONLY on these. Every other tradeable symbol is
+# directional-only (ORB + Sweep Reversal), derived automatically — add a symbol
+# to STRIKE_INCREMENTS and it's directional unless it's listed here.
+FULL_STRATEGY_INSTRUMENTS    = {"SPY", "QQQ", "SPX", "IWM"}
+DIRECTIONAL_ONLY_INSTRUMENTS = set(STRIKE_INCREMENTS) - FULL_STRATEGY_INSTRUMENTS
+DIRECTIONAL_ONLY             = INSTRUMENT in DIRECTIONAL_ONLY_INSTRUMENTS
 CONTRACT_MULTIPLIER = 100
 
 # ─── ACCOUNT & RISK ───────────────────────────────────────────────────────────
