@@ -139,7 +139,7 @@ ORB_TRAIL_ACTIVATION        = 0.50
 FED_DAY_ORB_BOOST           = 0.20
 # When snapping an ORB strike target to the nearest available strike, break
 # toward the "higher" (more ITM / participation) or "lower" (further OTM) delta.
-ORB_STRIKE_DELTA_BIAS       = "higher"
+ORB_STRIKE_DELTA_BIAS       = "lower"
 
 # ─── SWEEP REVERSAL STRATEGY ──────────────────────────────────────────────────
 
