@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# setup_ec2.sh — options_trader v2.5 EC2 Setup
+# setup_ec2.sh — options_trader v3.0 EC2 Setup
 # v1.0 — original release
 # v2.0 — 2026-06-27 — QQQ/SPX banner, Telegram only, VERSION=2.0
 # v2.1 — 2026-06-27 — auto git init on fresh install
@@ -18,6 +18,8 @@
 # v2.5 — 2026-06-30 — strip full URL/protocol from GITHUB_REPO input to prevent
 #         doubled "https://github.com/https://github.com/..." remote URLs
 #         if the operator pastes a full URL instead of "owner/repo"
+# v3.0 — 2026-07-05 — chmod +x moved to after git reset --hard so git never
+#         strips execute bits; now covers all .sh files recursively
 #
 # QQQ/SPX 0DTE | TastyTrade OAuth | Telegram alerts
 # =============================================================================
@@ -199,7 +201,6 @@ rsync -a \
     --exclude='bot.log' \
     --exclude='__pycache__' \
     "$DEPLOY_DIR/" "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR"/*.sh 2>/dev/null || true
 
 for f in main.py config.py requirements.txt; do
     [ -f "$INSTALL_DIR/$f" ] || { echo "ERROR: $f missing. Aborting."; exit 1; }
@@ -278,6 +279,11 @@ if [ ! -d ".git" ]; then
         print_ok "Git repo initialized — add remote manually when ready"
     fi
 fi
+
+# Set execute permissions on ALL shell scripts after git operations.
+# Must run after git reset --hard which can strip permissions set during rsync.
+find "$INSTALL_DIR" -name "*.sh" -exec chmod +x {} \;
+find "$INSTALL_DIR" -name "get_orb_range.py" -exec chmod +x {} \;
 
 # ── Start bot ─────────────────────────────────────────────────────────────────
 print_info "Starting bot..."
