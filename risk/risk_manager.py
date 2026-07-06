@@ -1,5 +1,20 @@
 """
 risk/risk_manager.py — Position sizing and session circuit breaker.
+v1.5 — 2026-07-06 — DAILY CAP MADE DEFINITIVE & RESTART-PROOF:
+        (a) is_halted() now reads the day's realized net P&L straight from the
+            DB (trade_logger.realized_pnl_today()) on EVERY entry attempt — the
+            single source of truth, identical to what query.py/status.py show.
+            It no longer trusts an in-memory flag, so a restart (manual, deploy,
+            or Restart=always after a crash) can't clear the halt: the loss is
+            in trades.db and is re-read immediately. This is the bug that let
+            AVGO resume trading after a 09:48 restart wiped the in-memory halt.
+        (b) The cap binds to the SAME risk-per-trade the manager is constructed
+            with (the value used for sizing), not the module-level
+            DAILY_LOSS_LIMIT_USD frozen at import; explicit OT_DAILY_LOSS_LIMIT
+            still overrides. Removes the drift that showed a $200 default while
+            sizing ran at $1050. update_risk() keeps the cap in lockstep.
+        (c) reset_session() no longer sets _seeded=True (that line defeated the
+            DB re-seed); a fresh process re-reads the day's realized P&L.
 v1.0 — original release
 v1.1 — 2026-06-27 — remove TRADE_GRADE_C and Twilio references,
         clean up Grade C sizing logic
@@ -34,6 +49,7 @@ Session loss limit (NOT a halt):
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -87,15 +103,40 @@ class RiskManager:
         self._session_halted     = False
         self._reassess_requested = False
         self._session_pnl_usd    = 0.0
-        self._daily_loss_limit   = DAILY_LOSS_LIMIT_USD
+        self._daily_loss_limit   = self._resolve_daily_limit(risk_per_trade)
         self._seeded             = False
 
+    @staticmethod
+    def _resolve_daily_limit(risk_per_trade: float) -> float:
+        """Cap = the risk-per-trade actually in use (what sizing uses), so it
+        can never drift to a stale module default. An explicit OT_DAILY_LOSS_LIMIT
+        env value still overrides."""
+        override = os.environ.get("OT_DAILY_LOSS_LIMIT")
+        if override:
+            try:
+                return float(override)
+            except ValueError:
+                pass
+        return float(risk_per_trade)
+
     def update_risk(self, risk_usd: float):
-        self._risk_per_trade = risk_usd
+        self._risk_per_trade   = risk_usd
+        # Keep the daily cap tied to the live risk (unless explicitly overridden).
+        self._daily_loss_limit = self._resolve_daily_limit(risk_usd)
 
     @property
     def risk_per_trade(self) -> float:
         return self._risk_per_trade
+
+    def day_realized_pnl(self) -> float:
+        """DEFINITIVE realized net P&L for today, straight from the DB.
+        The one number every daily-loss decision references."""
+        try:
+            from database.trade_logger import get_trade_logger
+            return float(get_trade_logger().realized_pnl_today())
+        except Exception:
+            # If the DB is briefly unavailable, fall back to the in-memory tally.
+            return float(self._session_pnl_usd)
 
     def compute_size(self,
                      premium: float,
@@ -221,50 +262,50 @@ class RiskManager:
             pass
 
     def record_loss(self, pnl_usd: float = 0.0):
-        self._ensure_seeded()
         self._session_losses += 1
-        self._session_pnl_usd += pnl_usd          # negative for a loss
         # Reassess the regime after EVERY losing trade — a loss is fresh
         # information about whether the current regime read still holds.
         self._reassess_requested = True
+        # The halt decision comes from the DB (authoritative), not this counter.
+        net = self.day_realized_pnl()
         logger.warning(
             f"Session loss #{self._session_losses} (${pnl_usd:+.0f}) — "
-            f"day P&L ${self._session_pnl_usd:+.0f}; forcing regime reassessment"
+            f"day realized ${net:+.0f}; forcing regime reassessment"
         )
-        self._check_daily_loss_limit()
+        self.is_halted()   # evaluate + fire the halt alert at close time
 
     def record_win(self, pnl_usd: float = 0.0):
-        self._ensure_seeded()
-        self._session_pnl_usd += pnl_usd
-        logger.info(
-            f"Session win (${pnl_usd:+.0f}) — day P&L ${self._session_pnl_usd:+.0f}"
-        )
+        net = self.day_realized_pnl()
+        logger.info(f"Session win (${pnl_usd:+.0f}) — day realized ${net:+.0f}")
 
     def _check_daily_loss_limit(self):
-        """Halt NEW entries when the day's NET P&L is down by the daily loss
-        limit (default = per-trade risk). Wins offset losses, so a green day
-        keeps trading. Open positions keep being managed to exit."""
-        if self._session_halted:
-            return
-        if self._session_pnl_usd <= -self._daily_loss_limit:
+        """Back-compat shim — the authoritative check now lives in is_halted()."""
+        self.is_halted()
+
+    def is_halted(self) -> bool:
+        """Authoritative daily-loss gate. Reads today's realized net P&L from
+        the DB on every call (single source of truth — identical to what
+        query.py/status.py display), so it survives any restart and can't drift
+        from an in-memory tally. Latches once breached; wins offset losses so a
+        net-green day keeps trading."""
+        net = self.day_realized_pnl()
+        self._session_pnl_usd = net   # keep the in-memory mirror truthful
+        if net <= -self._daily_loss_limit and not self._session_halted:
             self._session_halted = True
             logger.warning(
-                f"\U0001F6D1 DAILY LOSS LIMIT HIT: day P&L "
-                f"${self._session_pnl_usd:+.0f} <= -${self._daily_loss_limit:.0f}. "
-                f"Halting NEW entries. Override via configure.sh."
+                f"\U0001F6D1 DAILY LOSS LIMIT HIT: day P&L ${net:+.0f} "
+                f"<= -${self._daily_loss_limit:.0f}. Halting NEW entries. "
+                f"Override via configure.sh."
             )
             try:
                 from notifications.alert_manager import get_alert_manager
                 get_alert_manager()._send(
-                    f"\U0001F6D1 DAILY LOSS LIMIT HIT — day P&L "
-                    f"${self._session_pnl_usd:+.0f} (limit ${self._daily_loss_limit:.0f}). "
-                    f"New entries halted. Override via configure.sh."
+                    f"\U0001F6D1 DAILY LOSS LIMIT HIT — day P&L ${net:+.0f} "
+                    f"(limit ${self._daily_loss_limit:.0f}). New entries halted. "
+                    f"Override via configure.sh."
                 )
             except Exception:
                 pass
-
-    def is_halted(self) -> bool:
-        self._ensure_seeded()
         return self._session_halted
 
     def consume_reassess_request(self) -> bool:
@@ -276,22 +317,31 @@ class RiskManager:
 
     def reset_session(self):
         self._session_losses     = 0
-        self._session_halted     = False
         self._reassess_requested = False
-        self._session_pnl_usd    = 0.0
-        self._seeded             = True   # fresh session starts flat
-        logger.info("Risk manager session reset")
+        self._seeded             = False   # allow the DB re-seed to run
+        # Re-derive halt state from the DB rather than blindly clearing it: on a
+        # genuine new day realized P&L is 0 (no closed trades) and this clears;
+        # on a mid-session restart it re-reads today's loss and STAYS halted.
+        self._session_pnl_usd    = self.day_realized_pnl()
+        self._session_halted     = self._session_pnl_usd <= -self._daily_loss_limit
+        logger.info(
+            f"Risk manager session reset — day realized "
+            f"${self._session_pnl_usd:+.0f}, halted={self._session_halted}"
+        )
 
     @property
     def session_losses(self) -> int:
         return self._session_losses
 
     def status_report(self) -> str:
+        net = self.day_realized_pnl()
+        headroom = self._daily_loss_limit + net   # $ left before the halt
         return (
             f"risk=${self._risk_per_trade:.0f}/trade "
-            f"day_pnl=${self._session_pnl_usd:+.0f} "
+            f"day_realized=${net:+.0f} "
             f"daily_limit=${self._daily_loss_limit:.0f} "
-            f"halted={self._session_halted}"
+            f"headroom=${headroom:.0f} "
+            f"halted={self.is_halted()}"
         )
 
 
