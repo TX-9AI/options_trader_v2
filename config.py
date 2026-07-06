@@ -187,6 +187,19 @@ CONDOR_ENTRY_CUTOFF_ET      = (14, 0)   # Standard entry cutoff
 
 TRAIL_ACTIVATION_PCT        = 0.50
 TRAIL_LOCK_PCT              = 0.25
+
+# ─── LONG-OPTION THETA PROTECTION + FVG PROFIT TRAIL ──────────────────────────
+# Theta bleed: exit a PROFITABLE long when the projected time decay over the next
+# THETA_LOOKAHEAD_MIN minutes would erase the current unrealized gain (direction
+# hasn't gone against us — the option is just handing the profit back to time).
+THETA_LOOKAHEAD_MIN         = 20     # minutes of decay to project
+RTH_MINUTES                 = 390    # 6.5h session, to convert daily theta → per-min
+# FVG-anchored trailing stop for longs: once armed, the stop parks at the FAR
+# edge of the nearest unfilled in-favor 1m FVG (room to pull back INTO the gap
+# for continuation); a close beyond the gap exits. Falls back to a % lock.
+FVG_TRAIL_ARM_PCT           = 0.20   # arm once the trade is up this much
+FVG_TRAIL_LOCK_PCT          = 0.80   # premium floor = 80% of current when no FVG
+
 POLL_INTERVAL_SECONDS       = 15
 
 # ─── REGIME CLASSIFICATION ────────────────────────────────────────────────────
