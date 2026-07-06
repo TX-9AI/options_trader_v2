@@ -151,6 +151,14 @@ SWEEP_DELTA_WEAK            = 0.30   # conviction -> 0.0 : near-ATM, participati
 SWEEP_DELTA_TOLERANCE       = 0.04   # acceptable band around the target delta
 SWEEP_MIN_REJECTION_PCT     = 0.003
 SWEEP_MAX_AGE_BARS          = 8
+# Entry-window tuning (separate pass from detection). The recovery window is now
+# ATR-aware: a fast reversal on a volatile name that has already moved isn't
+# rejected as "too far" — the window is the LARGER of a floor % or a multiple of
+# ATR%. BOS lookback is configurable and also accepts a BOS that printed on the
+# just-closed candle (so a 1-tick-late evaluation doesn't miss it).
+SWEEP_MAX_RECOVERY_PCT      = 0.02   # floor recovery window (fraction of sweep price)
+SWEEP_RECOVERY_ATR_MULT     = 1.5    # ...or this × ATR%, whichever is larger
+SWEEP_BOS_LOOKBACK          = 5      # 1m candles used as the BOS structure reference
 
 # ─── BUTTERFLY STRATEGY ───────────────────────────────────────────────────────
 
