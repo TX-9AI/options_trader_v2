@@ -55,7 +55,8 @@ from zoneinfo import ZoneInfo
 from config import (
     POLL_INTERVAL_SECONDS, LOG_LEVEL, LOG_FILE, LOG_ROTATION_MB,
     PAPER_TRADING, RISK_PER_TRADE_USD, SESSION_LOSS_LIMIT,
-    REGIME_REASSESS_MINUTES, INSTRUMENT, SessionConfig, DIRECTIONAL_ONLY
+    REGIME_REASSESS_MINUTES, INSTRUMENT, SessionConfig, DIRECTIONAL_ONLY,
+    NO_ENTRY_AFTER_ET
 )
 
 
@@ -86,7 +87,7 @@ _setup_logging()
 logger = logging.getLogger(__name__)
 
 from utils.time_utils import (
-    now_utc, fmt_et_short, minutes_since, is_rth,
+    now_utc, now_et, fmt_et_short, minutes_since, is_rth,
     seconds_until_rth_open, is_hard_close_time
 )
 from data.data_cache import get_cache
@@ -168,15 +169,26 @@ def run_analysis(state: BotState) -> dict:
     orb = get_orb_engine().update(df_5m, df_1m, price, _regime_str)
 
     # Write ORB state to JSON file so status.py can read it directly
-    # without parsing bot.log — eliminates all log-parsing timing issues
+    # without parsing bot.log — eliminates all log-parsing timing issues.
+    # Includes the disarm reason, break latches, live price and the 11:00
+    # cutoff flag so status can render the true engine state (DISARMED / EXPIRED
+    # / price-vs-range) rather than inferring it from the clock.
     try:
         import json as _json
+        _eng = get_orb_engine()
+        _now_et = now_et()
         _orb_state = {
-            "high":    orb.orb_high if orb.orb_high > 0 else None,
-            "low":     orb.orb_low  if orb.orb_low  > 0 else None,
-            "width":   orb.orb_width,
-            "state":   orb.state,
-            "attempt": orb.attempt_number,
+            "high":       orb.orb_high if orb.orb_high > 0 else None,
+            "low":        orb.orb_low  if orb.orb_low  > 0 else None,
+            "width":      orb.orb_width,
+            "state":      orb.state,
+            "attempt":    orb.attempt_number,
+            "reason":     orb.invalidation_reason,
+            "broke_high": _eng.broke_high,
+            "broke_low":  _eng.broke_low,
+            "price":      price,
+            "past_cutoff": (_now_et.hour, _now_et.minute) >= NO_ENTRY_AFTER_ET,
+            "updated_at": _now_et.strftime("%Y-%m-%d %H:%M:%S ET"),
         }
         _state_path = os.path.join(os.path.dirname(LOG_FILE), "orb_state.json")
         with open(_state_path, "w") as _f:
@@ -414,7 +426,10 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     signal = None
 
     # ── Strategy dispatch: regime → strategy ──────────────────────────────────
-    # Priority 1: ORB (if confirmed AND regime is trending or breakout)
+    # Priority 1: ORB — only when the engine has a CONFIRMED break+retest.
+    # Note: the engine defers OPEN when regime==SWEEP_REVERSAL (sweeps take
+    # priority), so an OPEN state here already implies a non-sweep regime and a
+    # real ORB setup. Sweep reversal is handled at Priority 2.
     orb = ctx["orb"]
     if (orb.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT) and
             regime.primary_regime in (
@@ -432,28 +447,7 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
         )
         if orb_sig:
             signal = orb_sig
-            # ORB-window override: during the ORB window, if a sweep reversal is
-            # setting up with HIGHER probability than the ORB, take the sweep.
-            # A breakout-without-retest is exactly when sweep odds spike.
-            if regime.sweep_recent:
-                sweep_sig = _sweep_strategy.generate_signal(
-                    regime        = regime,
-                    vol_state     = ctx["vol"],
-                    structure     = ctx["structure"],
-                    liq_map       = ctx["liq_map"],
-                    chain         = chain,
-                    macro         = macro,
-                    df_1m         = ctx.get("df_1m"),
-                    current_price = ctx["price"]
-                )
-                if sweep_sig and getattr(sweep_sig, "conviction", 0.0) > getattr(orb_sig, "conviction", 0.0):
-                    logger.info(
-                        f"ORB-window override: sweep conviction "
-                        f"{sweep_sig.conviction:.2f} > ORB {orb_sig.conviction:.2f} — taking sweep"
-                    )
-                    signal = sweep_sig
-            if signal is orb_sig:
-                get_orb_engine().mark_triggered()
+            get_orb_engine().mark_triggered()
 
     # Priority 2: Sweep Reversal
     if signal is None and regime.primary_regime == Regime.SWEEP_REVERSAL:

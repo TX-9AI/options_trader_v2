@@ -22,6 +22,11 @@ v1.8 — 2026-07-02 — consume the orb_range.json "status" field (ESTABLISHED/
 v1.9 — 2026-07-02 — reword loss-limit banner: the limit now forces a regime
         reassessment (session continues), not a halt.
 v1.10 — 2026-07-02 — banner reflects the NET daily loss halt (day P&L <= -limit).
+v1.12 — 2026-07-06 — read authoritative orb_state.json (live engine state:
+        disarm reason, break latches, price, 11:00 cutoff) instead of clock
+        inference/log-scraping. Adds a live Price line, shows DISARMED (runaway
+        past 50% TP) and EXPIRED (past 11:00) truthfully, and reports price vs
+        range instead of always saying "inside range, waiting".
 v1.11 — 2026-07-03 — show live Risk per trade ($ from OT_RISK_USD) under Mode.
 
 Run: python status.py
@@ -122,7 +127,7 @@ ORB_STATE_LABELS = {
     "INVALIDATED":                 "Invalidated, re-arming",
     "OPEN_LONG":                   "OPEN LONG (confirmed)",
     "OPEN_SHORT":                  "OPEN SHORT (confirmed)",
-    "EXPIRED":                     "Expired (past 2PM cutoff)",
+    "EXPIRED":                     "Expired (past 11:00 ET cutoff)",
     "IN_PROGRESS":                 "Opening range forming (9:30-9:35 ET)",
     "EXPIRED_RANGE":               "Last session's range - today NOT established",
     "NOT_ESTABLISHED":             "Today's range not established",
@@ -137,45 +142,63 @@ def get_regime_and_orb():
     gex_pin   = None
     gex_env   = None
 
-    # ORB range: read directly from orb_range.json — no log parsing
+    # ── ORB state: prefer orb_state.json (authoritative LIVE engine state) ────
+    # Written every tick by run_analysis(); carries the true state incl. disarm
+    # reason, break latches, live price and the 11:00 cutoff — no clock guessing,
+    # no log parsing. Falls back to orb_range.json (+11:00 clock) only if the
+    # state file isn't present yet.
     orb = {
-        "high":    None,
-        "low":     None,
-        "width":   None,
-        "state":   "UNKNOWN",
-        "attempt": 0,
+        "high": None, "low": None, "width": None, "state": "UNKNOWN",
+        "attempt": 0, "reason": "", "broke_high": False, "broke_low": False,
+        "price": None, "past_cutoff": False,
     }
-
+    import json
+    orb_state_file = os.path.join(INSTALL_DIR, "orb_state.json")
     orb_range_file = os.path.join(INSTALL_DIR, "orb_range.json")
+
+    _have_state = False
+    if os.path.exists(orb_state_file):
+        try:
+            with open(orb_state_file) as f:
+                sd = json.load(f)
+            orb.update({
+                "high": sd.get("high"), "low": sd.get("low"), "width": sd.get("width"),
+                "state": sd.get("state", "UNKNOWN"), "attempt": sd.get("attempt", 0),
+                "reason": sd.get("reason", "") or "", "broke_high": sd.get("broke_high", False),
+                "broke_low": sd.get("broke_low", False), "price": sd.get("price"),
+                "past_cutoff": sd.get("past_cutoff", False),
+            })
+            _have_state = True
+        except Exception:
+            pass
+
     if os.path.exists(orb_range_file):
         try:
-            import json
             with open(orb_range_file) as f:
-                orb_data = json.load(f)
-            orb["high"]  = orb_data.get("high")
-            orb["low"]   = orb_data.get("low")
-            orb["width"] = orb_data.get("width")
-            orb["range_status"] = str(orb_data.get("status", "")).upper()
-            orb["range_date"]   = orb_data.get("date")
+                rd = json.load(f)
+            orb["range_status"] = str(rd.get("status", "")).upper()
+            orb["range_date"]   = rd.get("date")
+            if orb["high"]  is None: orb["high"]  = rd.get("high")
+            if orb["low"]   is None: orb["low"]   = rd.get("low")
+            if orb["width"] is None: orb["width"] = rd.get("width")
 
-            today = datetime.now(ET).strftime("%Y-%m-%d")
-            if orb["range_status"] == "ESTABLISHED" and orb["range_date"] == today:
-                # Today's live range — infer engine state from the clock;
-                # the log scan below refines it (break/retest/confirmed).
-                now = datetime.now(ET)
-                hm  = (now.hour, now.minute)
-                if not (9 <= now.hour < 16) or hm >= (14, 0):
-                    orb["state"] = "EXPIRED"
-                elif hm >= (9, 35):
-                    orb["state"] = "RANGING"
+            if not _have_state:
+                # Fallback only — infer from the clock using the REAL 11:00 cutoff
+                today = datetime.now(ET).strftime("%Y-%m-%d")
+                if orb["range_status"] == "ESTABLISHED" and orb["range_date"] == today:
+                    now = datetime.now(ET); hm = (now.hour, now.minute)
+                    if not (9 <= now.hour < 16) or hm >= (11, 0):
+                        orb["state"] = "EXPIRED"; orb["past_cutoff"] = hm >= (11, 0)
+                    elif hm >= (9, 35):
+                        orb["state"] = "RANGING"
+                    else:
+                        orb["state"] = "WAITING"
+                elif orb["range_status"] == "IN_PROGRESS":
+                    orb["state"] = "IN_PROGRESS"
+                elif orb["range_status"] == "EXPIRED":
+                    orb["state"] = "EXPIRED_RANGE"
                 else:
-                    orb["state"] = "WAITING"
-            elif orb["range_status"] == "IN_PROGRESS":
-                orb["state"] = "IN_PROGRESS"
-            elif orb["range_status"] == "EXPIRED":
-                orb["state"] = "EXPIRED_RANGE"
-            else:
-                orb["state"] = "NOT_ESTABLISHED"
+                    orb["state"] = "NOT_ESTABLISHED"
         except Exception:
             pass
 
@@ -210,35 +233,8 @@ def get_regime_and_orb():
             if "STRATEGY: NO TRADE" in line and strategy == "UNKNOWN":
                 strategy = "No Trade"
 
-            _live_today = (orb.get("range_status") == "ESTABLISHED"
-                           and orb.get("range_date") == datetime.now(ET).strftime("%Y-%m-%d"))
-            if _live_today and orb["state"] in ("UNKNOWN", "RANGING", "WAITING"):
-                if "ORB CONFIRMED LONG" in line:
-                    orb["state"] = "OPEN_LONG"
-                elif "ORB CONFIRMED SHORT" in line:
-                    orb["state"] = "OPEN_SHORT"
-                elif "ORB BREAK HIGH" in line:
-                    orb["state"] = "BREAK_HIGH_AWAITING_RETEST"
-                    m = re.search(r"attempt #(\d+)", line)
-                    if m: orb["attempt"] = int(m.group(1))
-                elif "ORB BREAK LOW" in line:
-                    orb["state"] = "BREAK_LOW_AWAITING_RETEST"
-                    m = re.search(r"attempt #(\d+)", line)
-                    if m: orb["attempt"] = int(m.group(1))
-                elif "ORB INVALIDATED" in line:
-                    orb["state"] = "INVALIDATED"
-                elif "retest timeout" in line:
-                    orb["state"] = "INVALIDATED"
-                elif "ORB: past 14:00" in line:
-                    orb["state"] = "EXPIRED"
-                elif "ORB re-armed" in line:
-                    orb["state"] = "RANGING"
-                    m = re.search(r"attempt #(\d+)", line)
-                    if m: orb["attempt"] = int(m.group(1))
-                elif "ORB range ESTABLISHED:" in line:
-                    orb["state"] = "RANGING"
-                elif "ORB engine reset" in line:
-                    orb["state"] = "WAITING"
+            # ORB state is taken from orb_state.json (authoritative) above — no
+            # log-scan refinement needed.
 
             if "GEX computed:" in line and gex_pin is None:
                 try:
@@ -340,26 +336,55 @@ def main():
     print(f"  \U0001F4CA Regime:      {regime}")
     print(f"  \U0001F3AF Strategy:    {strategy}")
 
+    # Live underlying price (from orb_state.json, written each tick)
+    _price = orb.get("price")
+    if _price:
+        print(f"  \U0001F4B2 Price:       {_price:.2f}")
+
     if orb["high"] is not None and orb["low"] is not None:
         print(f"  \u23F1  ORB High:    {orb['high']:.2f}")
         print(f"      ORB Low:     {orb['low']:.2f}")
         print(f"      ORB Width:   {orb['width']:.2f}")
-        # If state is still UNKNOWN (e.g. fresh install, empty log) but we
-        # have the range, check the current time to infer the correct state
-        if orb["state"] in ("UNKNOWN", "RANGING"):
-            now = datetime.now(ET)
-            hm = (now.hour, now.minute)
-            if not (9 <= now.hour < 16):
-                orb["state"] = "EXPIRED"
-            elif hm >= (14, 0):
-                orb["state"] = "EXPIRED"
-        state_label = ORB_STATE_LABELS.get(orb["state"], orb["state"])
+
+        # Truthful state label straight from the engine (orb_state.json).
+        st = orb["state"]
+        reason = orb.get("reason", "")
+        if st == "EXPIRED" or orb.get("past_cutoff"):
+            state_label = "\u26D4 EXPIRED — past 11:00 ET cutoff (no ORB entries)"
+        elif st == "INVALIDATED" and reason == "runaway":
+            state_label = "\U0001F6D1 DISARMED — ran past 50% TP, no retest (favors sweep)"
+        elif st == "INVALIDATED" and reason == "close_inside":
+            state_label = "Invalidated (closed back inside) — re-arming"
+        elif st == "INVALIDATED" and reason == "timeout":
+            state_label = "Invalidated (retest timeout) — dormant"
+        elif st in ("OPEN_LONG", "OPEN_SHORT"):
+            state_label = ORB_STATE_LABELS.get(st, st)
+        elif st in ("BREAK_HIGH_AWAITING_RETEST", "BREAK_LOW_AWAITING_RETEST"):
+            state_label = ORB_STATE_LABELS.get(st, st)
+        elif st == "RANGING":
+            # show where price sits vs the range so "inside/broke out" is honest
+            if _price is not None and _price > orb["high"]:
+                state_label = "Broke ABOVE range — awaiting retest/close"
+            elif _price is not None and _price < orb["low"]:
+                state_label = "Broke BELOW range — awaiting retest/close"
+            else:
+                state_label = "Inside range, awaiting break"
+        else:
+            state_label = ORB_STATE_LABELS.get(st, st)
+
+        # break latches (which side has registered a 1m close-out)
+        bh, bl = orb.get("broke_high"), orb.get("broke_low")
+        brk = []
+        if bh: brk.append("H")
+        if bl: brk.append("L")
+        brk_note = f"  [broke: {'/'.join(brk)}]" if brk else ""
+
         attempt_str = f"  (attempt #{orb['attempt']})" if orb["attempt"] > 0 else ""
         if orb.get("range_status"):
             rs = orb["range_status"]
             date_note = f"  [{orb.get('range_date')}]" if rs != "ESTABLISHED" else ""
             print(f"      Range:       {rs}{date_note}")
-        print(f"      State:       {state_label}{attempt_str}")
+        print(f"      State:       {state_label}{attempt_str}{brk_note}")
     else:
         print(f"  \u23F1  ORB:         Waiting for 9:35 ET range to be set")
 
