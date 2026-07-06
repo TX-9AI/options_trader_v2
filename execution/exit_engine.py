@@ -12,6 +12,13 @@ v1.2 — 2026-06-30 — ORB no longer hard-exits at 100% TP. Past 100%, the trai
         protecting the bulk of gains if the move actually reverses. FVG
         detection is scoped to 1m data only, matching ORB entry/exit logic
         which is always evaluated on the 1-minute timeframe.
+v1.3 — 2026-07-06 — long-option THETA PROTECTION + generalized FVG trail:
+        (a) theta-bleed exit — a profitable long is closed when projected time
+            decay over THETA_LOOKAHEAD_MIN would erase the current gain (the
+            clock, not price, is the threat). Uses live per-contract theta.
+        (b) FVG-anchored trailing stop for ALL longs (ORB + Sweep), armed at
+            +FVG_TRAIL_ARM_PCT: parks at the far edge of the nearest unfilled
+            in-favor 1m FVG (room to continue), runs with the % trail (max wins).
 
 Exit triggers by strategy:
 
@@ -54,7 +61,8 @@ from database.trade_logger import TradeRecord, get_trade_logger
 from data.tasty_client import get_session, get_account, TastyClientError
 from config import (
     PAPER_TRADING, CONTRACT_MULTIPLIER,
-    BUTTERFLY_MAX_HOLD_MIN, TRAIL_LOCK_PCT, FVG_MIN_SIZE_PCT
+    BUTTERFLY_MAX_HOLD_MIN, TRAIL_LOCK_PCT, FVG_MIN_SIZE_PCT,
+    THETA_LOOKAHEAD_MIN, RTH_MINUTES, FVG_TRAIL_ARM_PCT, FVG_TRAIL_LOCK_PCT
 )
 from utils.time_utils import is_hard_close_time, minutes_since, now_utc, fmt_et_short
 
@@ -302,6 +310,12 @@ class ExitEngine:
                     )
                     return decision
 
+        # 2b. THETA BLEED \u2014 profitable but time is about to eat the gain
+        if self._theta_bleed(record, current_premium, pnl_pct):
+            decision.should_exit = True
+            decision.exit_reason = f"theta_bleed pnl={pnl_pct:.1%}"
+            return decision
+
         # 3. PAST 100% TP \u2014 switch to tightened FVG-aware trail, no hard exit
         if current_premium >= target:
             if not self._post_target_trail.get(trade_id, False):
@@ -322,11 +336,15 @@ class ExitEngine:
                 decision.new_trail_stop = trail_stop
             return decision
 
-        # 4. TRAIL \u2014 below 100% TP, activates at 50% TP, locks gains
+        # 4. TRAIL \u2014 below 100% TP: FVG-anchored once armed (+20%), plus the
+        #    50% % trail; the higher of the two governs.
+        if pnl_pct >= FVG_TRAIL_ARM_PCT:
+            self._update_fvg_trail(trade_id, current_premium, record, df_1m, direction)
         trail_stop = self._update_trail(
             trade_id, current_premium, entry_prem, trail_act,
             entry_prem * 0.75  # hard floor = 25% loss
         )
+        trail_stop = self._trail_stops.get(trade_id, trail_stop)
         if trail_stop is not None:
             if current_premium <= trail_stop:
                 decision.should_exit = True
@@ -388,7 +406,62 @@ class ExitEngine:
 
         return self._trail_stops.get(trade_id)
 
-    # \u2500\u2500\u2500 Sweep Reversal Exit \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # ─── Long-option theta protection + general FVG trail ─────────────────────
+    def _theta_bleed(self, record: TradeRecord, current_premium: float,
+                     pnl_pct: float) -> bool:
+        """True when a PROFITABLE long is bleeding to time: the projected theta
+        decay over the next THETA_LOOKAHEAD_MIN minutes would erase the current
+        unrealized gain. Only fires while in profit (direction hasn't gone
+        against us — a losing trade is handled by the stop, not this)."""
+        if pnl_pct <= 0:
+            return False
+        theta = abs(float(record.get("current_theta", 0.0) or 0.0))  # $/share/day
+        if theta <= 0:
+            return False
+        gain_per_share = current_premium - record["entry_premium"]
+        if gain_per_share <= 0:
+            return False
+        proj_decay = theta * (THETA_LOOKAHEAD_MIN / float(RTH_MINUTES))
+        return proj_decay >= gain_per_share
+
+    def _update_fvg_trail(self, trade_id: str, current_premium: float,
+                          record: TradeRecord, df_1m: Optional[pd.DataFrame],
+                          direction: str) -> Optional[float]:
+        """FVG-anchored trailing stop for a long, armed once profitable. The
+        stop parks at the FAR edge of the nearest unfilled in-favor 1m FVG
+        (converted to an equivalent premium floor) so the trade has room to pull
+        back INTO the gap for continuation; only a move beyond the gap exits.
+        Falls back to a % lock of current premium when no usable FVG exists.
+        Writes to the shared _trail_stops (highest trail wins)."""
+        entry_prem       = record["entry_premium"]
+        underlying_entry = record.get("underlying_entry", 0.0)
+        fvg_floor_premium = None
+
+        if df_1m is not None and len(df_1m) > 0 and underlying_entry > 0:
+            cur_under = float(df_1m["close"].iloc[-1])
+            move_from_entry = abs(cur_under - underlying_entry)
+            fvg = _nearest_unfilled_fvg_in_favor(df_1m, current_price=cur_under,
+                                                 direction=direction)
+            if fvg is not None and move_from_entry > 0:
+                premium_per_point = (current_premium - entry_prem) / move_from_entry
+                # FAR edge → room to wick INTO the gap before exiting
+                underlying_floor = fvg.bottom if direction == "long" else fvg.top
+                dist = abs(underlying_floor - underlying_entry)
+                fvg_floor_premium = entry_prem + dist * premium_per_point
+
+        pct_trail = current_premium * FVG_TRAIL_LOCK_PCT
+        new_trail = max(fvg_floor_premium, pct_trail) if fvg_floor_premium is not None else pct_trail
+
+        current_trail = self._trail_stops.get(trade_id, entry_prem)
+        if new_trail > current_trail:
+            self._trail_stops[trade_id] = new_trail
+            logger.debug(
+                f"FVG trail: {trade_id[:8]} trail=${self._trail_stops[trade_id]:.2f} "
+                f"(fvg_based={fvg_floor_premium is not None})"
+            )
+        return self._trail_stops.get(trade_id)
+
+    # ─── Sweep Reversal Exit ──────────────────────────────────────────────────
 
     def _evaluate_sweep(self, record: TradeRecord,
                          current_premium: float,
@@ -440,10 +513,20 @@ class ExitEngine:
                 decision.exit_reason = f"bos_exit pnl={pnl_pct:.1%}"
                 return decision
 
-        # 5. TRAIL
+        # 4b. THETA BLEED \u2014 profitable but time is about to eat the gain
+        if self._theta_bleed(record, current_premium, pnl_pct):
+            decision.should_exit = True
+            decision.exit_reason = f"theta_bleed pnl={pnl_pct:.1%}"
+            return decision
+
+        # 5. TRAIL \u2014 FVG-anchored once armed (+20%), plus the 50% % trail; the
+        #    higher of the two governs (both write to _trail_stops).
+        if pnl_pct >= FVG_TRAIL_ARM_PCT:
+            self._update_fvg_trail(trade_id, current_premium, record, df_1m, direction)
         trail_stop = self._update_trail(
             trade_id, current_premium, entry_prem, trail_act, stop_prem
         )
+        trail_stop = self._trail_stops.get(trade_id, trail_stop)
         if trail_stop is not None:
             if current_premium <= trail_stop:
                 decision.should_exit = True
