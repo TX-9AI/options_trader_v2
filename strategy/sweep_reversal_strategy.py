@@ -1,5 +1,13 @@
 """
 strategy/sweep_reversal_strategy.py — Post-liquidity-sweep reversal for options.
+v1.3 — 2026-07-06 — ORB-BREAK GATE (registered break, not wick clear): before
+        the 11:00 ET cutoff a sweep may ONLY fire after a GENUINE breakout — a
+        1-min candle that CLOSED beyond the range (ORB engine broke_high /
+        broke_low). A wick that pokes the boundary and closes back inside is
+        still 'in range, awaiting break' → no trade (this was the AVGO hole).
+        High sweep needs a registered break HIGH; low sweep needs break LOW.
+        After 11:00 the ORB window is closed and the gate lifts.
+v1.2 — 2026-07-06 — ORB-boundary gate (wick clear) — superseded by v1.3.
 v1.1 — 2026-07-03 — OTM target delta scales inversely with reversal strength
         (regime conviction): strong -> far-OTM low delta, weak -> near-ATM.
 
@@ -20,11 +28,14 @@ from analysis.regime_classifier import RegimeState, Regime
 from analysis.volatility_engine import VolatilityState
 from analysis.structure_analyzer import StructureMap
 from analysis.liquidity_mapper import LiquidityMap, LiquiditySweep
+from analysis.orb_engine import get_orb_engine
 from data.options_chain import OptionsChain
 from data.options_chain import get_chain_fetcher
 from data.macro_data import MacroSnapshot
+from utils.time_utils import now_et
 from config import (
     SWEEP_DELTA_STRONG, SWEEP_DELTA_WEAK, SWEEP_MAX_AGE_BARS,
+    NO_ENTRY_AFTER_ET,
 )
 
 
@@ -86,6 +97,17 @@ class SweepReversalStrategy(BaseOptionsStrategy):
 
         if liq_map.sweep_age_bars > SWEEP_MAX_AGE_BARS:
             logger.debug(f"Sweep too old: {liq_map.sweep_age_bars} bars")
+            return None
+
+        # ── ORB-boundary gate ────────────────────────────────────────────────
+        # Before the ORB cutoff, only take sweeps that broke OUT of the opening
+        # range. Internal-range sweeps (chop) are the exact false positives that
+        # produced repeated same-direction entries inside the box.
+        if not self._sweep_broke_orb(sweep):
+            logger.debug(
+                f"Sweep blocked: {sweep.kind} @ {sweep.sweep_price:.2f} did not "
+                f"break the ORB boundary during the ORB window — deferring to ORB"
+            )
             return None
 
         # Determine reversal direction from sweep type
@@ -285,6 +307,34 @@ class SweepReversalStrategy(BaseOptionsStrategy):
             f"confluence={signal.confluence_factors}"
         )
         return signal
+
+    def _sweep_broke_orb(self, sweep: LiquiditySweep) -> bool:
+        """Gate: may this sweep fire given ORB containment?
+
+        A sweep reversal only arms after a GENUINE breakout — a 1-min candle
+        that CLOSED beyond the range (the same break that arms the ORB retest),
+        not a wick that pokes the boundary and closes back inside. That wick is
+        still 'in range, awaiting break' → no trade.
+
+        - Past the 11:00 ET ORB cutoff (NO_ENTRY_AFTER_ET): always True — the
+          ORB window is over, sweep reversal is free to work any level.
+        - No established range for today: True (nothing to gate on).
+        - Otherwise: a high sweep needs a registered break HIGH (a 1-min close
+          above the ORB high); a low sweep needs a registered break LOW.
+        """
+        now = now_et()
+        if (now.hour, now.minute) >= NO_ENTRY_AFTER_ET:
+            return True
+
+        eng = get_orb_engine()
+        if eng.data.orb_high <= 0 or eng.data.orb_low <= 0:
+            return True   # no established range to gate against
+
+        if sweep.kind == "high_sweep":
+            return eng.broke_high
+        if sweep.kind == "low_sweep":
+            return eng.broke_low
+        return True
 
     def _confirm_bos(self, df_1m: Optional[pd.DataFrame],
                       direction: str, current_price: float) -> bool:
