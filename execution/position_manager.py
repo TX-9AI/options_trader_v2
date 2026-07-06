@@ -168,6 +168,9 @@ class PositionManager:
                         None
                     )
                     if match:
+                        # stash live theta so the exit engine's theta-bleed
+                        # detector can see it (single-leg longs only)
+                        record["current_theta"] = float(getattr(match, "theta", 0.0) or 0.0)
                         return match.mark
             except Exception:
                 pass
