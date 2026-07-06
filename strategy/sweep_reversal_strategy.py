@@ -1,5 +1,10 @@
 """
 strategy/sweep_reversal_strategy.py — Post-liquidity-sweep reversal for options.
+v1.4 — 2026-07-06 — entry-gate tuning (separate pass from detection): recovery
+        window is ATR-aware (LARGER of SWEEP_MAX_RECOVERY_PCT or
+        SWEEP_RECOVERY_ATR_MULT × ATR%) so fast/volatile reversals aren't
+        rejected as "too far"; BOS lookback is configurable (SWEEP_BOS_LOOKBACK)
+        and also accepts a BOS that closed on the just-closed candle.
 v1.3 — 2026-07-06 — ORB-BREAK GATE (registered break, not wick clear): before
         the 11:00 ET cutoff a sweep may ONLY fire after a GENUINE breakout — a
         1-min candle that CLOSED beyond the range (ORB engine broke_high /
@@ -36,6 +41,7 @@ from utils.time_utils import now_et
 from config import (
     SWEEP_DELTA_STRONG, SWEEP_DELTA_WEAK, SWEEP_MAX_AGE_BARS,
     NO_ENTRY_AFTER_ET,
+    SWEEP_MAX_RECOVERY_PCT, SWEEP_RECOVERY_ATR_MULT, SWEEP_BOS_LOOKBACK,
 )
 
 
@@ -139,10 +145,14 @@ class SweepReversalStrategy(BaseOptionsStrategy):
             logger.debug("Sweep long: price not recovered above swept level")
             return None
 
-        # Don't enter too far from the sweep (>2% away = missed it)
+        # Don't enter too far from the sweep. Window is ATR-aware: the LARGER
+        # of a floor % or a multiple of ATR%, so a fast reversal that already
+        # moved on a volatile name isn't rejected as "missed".
         recovery_pct = (current_price - sweep.sweep_price) / max(sweep.sweep_price, 1)
-        if recovery_pct > 0.02:
-            logger.debug(f"Sweep long: too far from sweep ({recovery_pct:.1%})")
+        max_recovery = max(SWEEP_MAX_RECOVERY_PCT,
+                           SWEEP_RECOVERY_ATR_MULT * vol_state.atr_normalized)
+        if recovery_pct > max_recovery:
+            logger.debug(f"Sweep long: too far from sweep ({recovery_pct:.1%} > {max_recovery:.1%})")
             return None
 
         # BOS confirmation: 1m candle structure shows bullish shift
@@ -233,8 +243,10 @@ class SweepReversalStrategy(BaseOptionsStrategy):
             return None
 
         recovery_pct = (sweep.sweep_price - current_price) / max(sweep.sweep_price, 1)
-        if recovery_pct > 0.02:
-            logger.debug(f"Sweep short: too far from sweep ({recovery_pct:.1%})")
+        max_recovery = max(SWEEP_MAX_RECOVERY_PCT,
+                           SWEEP_RECOVERY_ATR_MULT * vol_state.atr_normalized)
+        if recovery_pct > max_recovery:
+            logger.debug(f"Sweep short: too far from sweep ({recovery_pct:.1%} > {max_recovery:.1%})")
             return None
 
         if not self._confirm_bos(df_1m, "short", current_price):
@@ -340,22 +352,22 @@ class SweepReversalStrategy(BaseOptionsStrategy):
                       direction: str, current_price: float) -> bool:
         """
         Confirm 1-min Break of Structure in the reversal direction.
-        BOS = price closes above the most recent swing high (long)
-              or below the most recent swing low (short)
-        Uses closed candles only (iloc[-2] and before).
+        BOS = price closes above the most recent swing high (long) or below the
+        most recent swing low (short), over SWEEP_BOS_LOOKBACK closed candles.
+        Also accepts a BOS that already CLOSED on the just-closed candle, so a
+        one-tick-late evaluation doesn't miss it. Uses closed candles only.
         """
-        if df_1m is None or len(df_1m) < 5:
+        lb = max(2, SWEEP_BOS_LOOKBACK)
+        if df_1m is None or len(df_1m) < lb + 1:
             return False
 
-        # Look at last 5 closed 1m candles (exclude the current forming candle)
-        recent = df_1m.iloc[-6:-1]
+        # last `lb` closed candles (exclude the current forming candle)
+        recent     = df_1m.iloc[-(lb + 1):-1]
+        last_close = float(df_1m.iloc[-2]["close"])
 
         if direction == "long":
-            # BOS: current price above the high of any of the last 5 candles
-            recent_high = float(recent["high"].max())
-            return current_price > recent_high
-
+            ref = float(recent["high"].max())
+            return current_price > ref or last_close > ref
         else:  # short
-            # BOS: current price below the low of any of the last 5 candles
-            recent_low = float(recent["low"].min())
-            return current_price < recent_low
+            ref = float(recent["low"].min())
+            return current_price < ref or last_close < ref
