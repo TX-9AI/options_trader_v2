@@ -1,5 +1,12 @@
 """
 analysis/orb_engine.py — Opening Range Breakout state machine.
+v1.8 — 2026-07-06 — (a) session break latches broke_high/broke_low set on a
+        1-min CLOSE beyond the range — these arm the sweep reversal (same break
+        the ORB retest uses), so a wick poke that closes back inside no longer
+        arms a sweep. (b) retest confirm DEFERS when regime==SWEEP_REVERSAL
+        (sweeps take priority) so the engine can't get stuck in a phantom OPEN.
+        (c) re-arm rule tightened to: 1-min close back inside AND before 11:00
+        (runaway/timeout never re-arm).
 v1.0 — original release
 v1.1 — 2026-06-30 — full state model rewrite
 v1.2 — 2026-06-30 — fix cutoff check running before range-setting
@@ -83,14 +90,32 @@ class ORBEngine:
     def __init__(self):
         self._data = ORBData()
         self._range_date = None
+        # Session-level latches: did a 1-min candle CLOSE beyond the range this
+        # session? These arm the sweep reversal (a sweep needs the SAME
+        # registered break as the ORB retest). They survive _rearm() and are
+        # only cleared by reset_for_session().
+        self._broke_high = False
+        self._broke_low  = False
 
     @property
     def data(self) -> ORBData:
         return self._data
 
+    @property
+    def broke_high(self) -> bool:
+        """True once a 1-min candle CLOSED above the ORB high this session."""
+        return self._broke_high
+
+    @property
+    def broke_low(self) -> bool:
+        """True once a 1-min candle CLOSED below the ORB low this session."""
+        return self._broke_low
+
     def reset_for_session(self):
         self._data = ORBData()
         self._range_date = None
+        self._broke_high = False
+        self._broke_low  = False
         logger.info("ORB engine reset for new session")
 
     def _rearm(self):
@@ -151,9 +176,6 @@ class ORBEngine:
                current_price: float, regime: Optional[str] = None) -> ORBData:
         d = self._data
 
-        if d.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT):
-            return d
-
         # Load range from file if not yet set for today
         today = now_et().strftime("%Y-%m-%d")
         if self._range_date != today or d.orb_high == 0.0:
@@ -163,10 +185,11 @@ class ORBEngine:
         past_orb_cutoff = (now.hour, now.minute) >= NO_ENTRY_AFTER_ET
         d.entries_expired = past_orb_cutoff
 
-        # 11:00 ET HARD cutoff — the ORB window is over. Expire regardless of
-        # state (including awaiting-retest), so the bot moves on to other
-        # regimes (sweep reversal, condor, butterfly). A confirmed OPEN position
-        # returned early above and is untouched (it exits on its own rules).
+        # 11:00 ET HARD cutoff — the ORB window is over. Expire from ANY state,
+        # including OPEN_LONG/OPEN_SHORT, so the engine stops watching and can
+        # never hold a phantom OPEN past the window. (A real live position is
+        # managed by the position manager and exits on its own rules; expiring
+        # the ENGINE state here does not touch the position.)
         if past_orb_cutoff:
             if d.state != ORBState.EXPIRED:
                 d.state = ORBState.EXPIRED
@@ -176,26 +199,29 @@ class ORBEngine:
                 )
             return d
 
+        # Before the cutoff, a confirmed OPEN is left untouched (a live ORB
+        # trade is being managed elsewhere; the engine doesn't re-fire).
+        if d.state in (ORBState.OPEN_LONG, ORBState.OPEN_SHORT):
+            return d
+
         if d.state == ORBState.RANGING:
             self._check_for_break(df_1m)
 
         if d.state in (ORBState.BREAK_HIGH_AWAITING_RETEST, ORBState.BREAK_LOW_AWAITING_RETEST):
-            self._check_for_retest(df_1m)
+            self._check_for_retest(df_1m, regime)
 
         if d.state == ORBState.INVALIDATED:
-            # Re-arm ONLY after a (b) close-inside invalidation AND while the
-            # regime is still ORB-friendly. After an (a) runaway, or once the
-            # regime has shifted to sweep/trend/breakout, stand down so the bot
-            # works the other regime's setup instead. Re-checked each tick, so
-            # ORB can re-arm later if the regime returns to friendly before 11:00.
-            ORB_FRIENDLY = ("RANGING", "COMPRESSION", "UNKNOWN")
-            orb_friendly = (regime is None) or (regime in ORB_FRIENDLY)
-            if d.invalidation_reason == "close_inside" and orb_friendly:
+            # Re-arm ONLY after a (b) close-inside invalidation. Past 11:00 the
+            # engine already EXPIRED above, so this branch is inherently
+            # before-cutoff — i.e. the rule is exactly "1-min close back inside
+            # the range AND before 11:00". A runaway (a) NEVER re-arms (it hands
+            # off to sweep reversal); a timeout NEVER re-arms.
+            if d.invalidation_reason == "close_inside":
                 self._rearm()
             else:
                 logger.debug(
                     f"ORB dormant after '{d.invalidation_reason}' invalidation "
-                    f"(regime={regime}) — deferring to other strategies"
+                    f"(regime={regime}) — deferring to sweep reversal"
                 )
 
         return d
@@ -230,6 +256,7 @@ class ORBEngine:
             d.target_strike      = orb_strike_selection(d.orb_high, d.orb_low, "long", STRIKE_INCREMENT)
             d.attempt_number    += 1
             d.state              = ORBState.BREAK_HIGH_AWAITING_RETEST
+            self._broke_high     = True   # 1-min CLOSE cleared the high — arms sweep (high side)
             logger.info(
                 f"ORB BREAK HIGH (attempt #{d.attempt_number}): close={close:.2f} "
                 f"above {d.orb_high:.2f} target={d.target_100pct:.2f} strike={d.target_strike}"
@@ -246,12 +273,13 @@ class ORBEngine:
             d.target_strike      = orb_strike_selection(d.orb_high, d.orb_low, "short", STRIKE_INCREMENT)
             d.attempt_number    += 1
             d.state              = ORBState.BREAK_LOW_AWAITING_RETEST
+            self._broke_low      = True   # 1-min CLOSE cleared the low — arms sweep (low side)
             logger.info(
                 f"ORB BREAK LOW (attempt #{d.attempt_number}): close={close:.2f} "
                 f"below {d.orb_low:.2f} target={d.target_100pct:.2f} strike={d.target_strike}"
             )
 
-    def _check_for_retest(self, df_1m: pd.DataFrame):
+    def _check_for_retest(self, df_1m: pd.DataFrame, regime: Optional[str] = None):
         d = self._data
         if df_1m is None or len(df_1m) < 2:
             return
@@ -282,6 +310,12 @@ class ORBEngine:
                 )
                 return
             if low < d.orb_high and body_low >= d.orb_high * 0.999:
+                # Sweeps take priority when regime is sweep: don't confirm a
+                # phantom OPEN the dispatch will override — leave it awaiting
+                # retest so the engine can't get stuck OPEN with no position.
+                if regime == "SWEEP_REVERSAL":
+                    logger.debug("ORB retest met but regime=SWEEP_REVERSAL — deferring to sweep")
+                    return
                 d.state        = ORBState.OPEN_LONG
                 d.confirmed_at = str(now_et())
                 logger.info(f"ORB CONFIRMED LONG (attempt #{d.attempt_number}): wick={low:.2f} body_low={body_low:.2f}")
@@ -301,6 +335,9 @@ class ORBEngine:
                 )
                 return
             if high > d.orb_low and body_high <= d.orb_low * 1.001:
+                if regime == "SWEEP_REVERSAL":
+                    logger.debug("ORB retest met but regime=SWEEP_REVERSAL — deferring to sweep")
+                    return
                 d.state        = ORBState.OPEN_SHORT
                 d.confirmed_at = str(now_et())
                 logger.info(f"ORB CONFIRMED SHORT (attempt #{d.attempt_number}): wick={high:.2f} body_high={body_high:.2f}")
