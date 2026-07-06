@@ -8,16 +8,20 @@ v1.2 — 2026-07-02 — condor-leg support: spread columns (short/long strike,
         short/long symbol) + get_open_trades() for concurrent condor legs.
 v1.3 — 2026-07-02 — add generic update_fields() (used by the broken-wing roll
         to flag rolled/tested legs is_broken_wing).
+v1.4 — 2026-07-06 — DEFINITIVE realized-P&L primitive: realized_pnl_today()
+        (single source of truth for the daily-loss circuit breaker, status and
+        query) with ET-correct session bucketing; today_summary() routed through
+        it so displays and the halt can never disagree.
 """
 
 import logging
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import DB_PATH
-from utils.time_utils import ts_for_db, now_utc
+from utils.time_utils import ts_for_db, now_utc, now_et, ET
 
 logger = logging.getLogger(__name__)
 
@@ -289,18 +293,53 @@ class TradeLogger:
             ).fetchone()
         return row[field] if row else None
 
-    def today_summary(self) -> dict:
-        today = now_utc().strftime("%Y-%m-%d")
+    # ── DEFINITIVE closed-P&L accounting ──────────────────────────────────────
+    # Single source of truth for realized (closed) P&L. Every consumer — the
+    # daily-loss circuit breaker, status.py, query.py, EOD — references THESE
+    # methods, never an in-memory copy and never a parallel re-sum. That is what
+    # lets any bot reference its definitive day P&L immediately and survive any
+    # restart: the number lives in trades.db, not in process memory.
+    @staticmethod
+    def _et_date(iso_ts: str) -> str:
+        """ET calendar date ('YYYY-MM-DD') for a stored UTC ISO timestamp.
+        Bucketing by ET (not UTC) so a late-session trade never lands on the
+        wrong day."""
+        try:
+            dt = datetime.fromisoformat(iso_ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(ET).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    def _closed_today_rows(self) -> List[sqlite3.Row]:
+        """Closed trades whose ET session date is today. Coarse UTC prefilter
+        keeps the scan tiny; the exact match is done by ET date in Python."""
+        today_et = now_et().strftime("%Y-%m-%d")
+        lower = (now_utc() - timedelta(days=1)).strftime("%Y-%m-%d")
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT COUNT(*) as total,
-                       SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
-                       SUM(CASE WHEN pnl_usd < 0 THEN 1 ELSE 0 END) as losses,
-                       COALESCE(SUM(pnl_usd), 0) as total_pnl
-                FROM trades
-                WHERE status='closed' AND date(entry_time) = ?
-            """, (today,)).fetchone()
-        return dict(rows) if rows else {}
+                SELECT * FROM trades
+                WHERE status='closed' AND pnl_usd IS NOT NULL
+                AND date(entry_time) >= ?
+            """, (lower,)).fetchall()
+        return [r for r in rows if self._et_date(r["entry_time"]) == today_et]
+
+    def realized_pnl_today(self) -> float:
+        """DEFINITIVE realized net closed P&L for today's ET session (wins
+        offset losses). This is the number the daily loss limit gates on."""
+        return float(sum((r["pnl_usd"] or 0.0) for r in self._closed_today_rows()))
+
+    def today_summary(self) -> dict:
+        """Counts + net P&L for today's ET session. total_pnl is identical to
+        realized_pnl_today() — one computation, so displays and the circuit
+        breaker can never disagree."""
+        rows = self._closed_today_rows()
+        wins   = sum(1 for r in rows if (r["pnl_usd"] or 0) > 0)
+        losses = sum(1 for r in rows if (r["pnl_usd"] or 0) < 0)
+        total_pnl = float(sum((r["pnl_usd"] or 0.0) for r in rows))
+        return {"total": len(rows), "wins": wins, "losses": losses,
+                "total_pnl": total_pnl}
 
 
 _trade_logger: Optional[TradeLogger] = None
