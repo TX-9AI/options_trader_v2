@@ -3,6 +3,12 @@ analysis/liquidity_mapper.py — Institutional liquidity mapping.
 Tracks equal highs/lows, stop clusters, liquidity sweeps, and
 imbalance fills. Core input for the sweep reversal strategy.
 
+v1.2 — 2026-07-06 — detection fixes: recent_sweep is now selected by ACTUAL
+        TIME (own-timeframe bars_ago × tf minutes), not raw cross-timeframe bar
+        index; sweep_age_bars reported in consistent 5m-equivalent bars (fixes
+        the nonsense/negative age that let junk sweeps flip the regime and made
+        fresh sweeps look stale); duplicate same-level sweeps are collapsed.
+
 v1.1 additions:
 - Previous Day High/Low (PDH/PDL) as named high-value liquidity pools
 - Previous Session High/Low (Asia, London, NY) as named pools
@@ -49,6 +55,7 @@ class LiquiditySweep:
     rejection_pct:  float   = 0.0
     confirmed:      bool    = False
     bar_index:      int     = 0
+    bars_ago:       int     = 0      # bars since the sweep, in its OWN timeframe
     timeframe:      str     = ""
     # Was this sweep of a named level? (PDH/PDL/session)
     swept_named_level: str  = ""        # Name of the level swept, if any
@@ -126,11 +133,20 @@ class LiquidityMapper:
         # Nearby pools
         self._flag_nearby_pools(lmap, current_price)
 
-        # Most recent sweep
+        # Most recent sweep — selected by ACTUAL TIME, not raw bar index.
+        # bar_index is per-timeframe, so comparing a 15m index to a 5m index (as
+        # the old max-by-bar_index did) was meaningless and produced a nonsense
+        # (often negative) age. We convert each sweep's own-timeframe bars_ago
+        # into minutes, dedupe same-level sweeps found on multiple scans, pick
+        # the most recent by minutes, and report age in 5m-equivalent bars so
+        # the downstream <=8 thresholds stay consistent across timeframes.
         confirmed = [s for s in lmap.sweeps if s.confirmed]
         if confirmed:
-            lmap.recent_sweep = max(confirmed, key=lambda s: s.bar_index)
-            lmap.sweep_age_bars = len(primary) - 1 - lmap.recent_sweep.bar_index
+            deduped = self._dedupe_sweeps(confirmed)
+            recent = min(deduped, key=lambda s: s.bars_ago * self._tf_minutes(s.timeframe))
+            minutes_ago = recent.bars_ago * self._tf_minutes(recent.timeframe)
+            lmap.recent_sweep   = recent
+            lmap.sweep_age_bars = max(0, round(minutes_ago / 5.0))   # 5m-equivalent bars
 
         named_levels = [p.name for p in lmap.pools if p.is_named]
         logger.debug(
@@ -140,6 +156,25 @@ class LiquidityMapper:
             f"age={lmap.sweep_age_bars}bars"
         )
         return lmap
+
+    @staticmethod
+    def _tf_minutes(tf: str) -> int:
+        """Minutes per bar for a timeframe label."""
+        return {"1m": 1, "5m": 5, "15m": 15, "1h": 60}.get(tf, 5)
+
+    @staticmethod
+    def _dedupe_sweeps(sweeps):
+        """Collapse sweeps of the same side + price level (found on multiple
+        timeframe scans) to a single entry, keeping the most recent by
+        minutes-ago. Prevents duplicate/phantom sweeps from skewing selection."""
+        best = {}
+        for s in sweeps:
+            key = (s.kind, round(s.pool_price, 2))
+            mins = s.bars_ago * LiquidityMapper._tf_minutes(s.timeframe)
+            cur = best.get(key)
+            if cur is None or mins < (cur.bars_ago * LiquidityMapper._tf_minutes(cur.timeframe)):
+                best[key] = s
+        return list(best.values())
 
     def _find_named_levels(self, lmap: LiquidityMap, df: pd.DataFrame):
         """
@@ -347,6 +382,7 @@ class LiquidityMapper:
                             rejection_pct=rejection_pct,
                             confirmed=True,
                             bar_index=i,
+                            bars_ago=(n - 1 - i),
                             timeframe=tf,
                             swept_named_level=pool.name if pool.is_named else ""
                         )
@@ -369,6 +405,7 @@ class LiquidityMapper:
                             rejection_pct=rejection_pct,
                             confirmed=True,
                             bar_index=i,
+                            bars_ago=(n - 1 - i),
                             timeframe=tf,
                             swept_named_level=pool.name if pool.is_named else ""
                         )
