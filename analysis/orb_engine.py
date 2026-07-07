@@ -1,5 +1,23 @@
 """
 analysis/orb_engine.py — Opening Range Breakout state machine.
+v1.9 — 2026-07-07 — FIX (grave): break latches broke_high/broke_low are now
+        maintained UNCONDITIONALLY every tick by _update_break_latches(),
+        decoupled from the RANGING-only _check_for_break() path. Previously the
+        latches were set solely inside _check_for_break(), which runs ONLY in
+        RANGING state — so once the engine left RANGING without re-arming
+        (runaway, retest-timeout, or a confirmed OPEN), it never re-checked for
+        a break and the OPPOSITE-side latch could never be set. A genuine
+        opposite-side 1-min CLOSE breakout after a one-sided runaway was
+        therefore invisible to the sweep-reversal gate (_sweep_broke_orb),
+        BLOCKING the highest-conviction failed-breakout reversals pre-11:00 —
+        and the surviving same-side latch could be leaned on while stale. The
+        latch is now a pure session fact ("did a 1-min candle CLOSE beyond this
+        boundary this session"), independent of ORB entry state. Preserved:
+        it stays CLOSE-based (a wick that pokes and closes back inside still
+        does NOT arm a sweep — the AVGO-trap protection) and latch-only (set
+        True; cleared solely by reset_for_session()). Fix is contained to this
+        file; downstream (sweep gate + orb_state.json) reads the properties
+        unchanged.
 v1.8 — 2026-07-06 — (a) session break latches broke_high/broke_low set on a
         1-min CLOSE beyond the range — these arm the sweep reversal (same break
         the ORB retest uses), so a wick poke that closes back inside no longer
@@ -185,6 +203,15 @@ class ORBEngine:
         past_orb_cutoff = (now.hour, now.minute) >= NO_ENTRY_AFTER_ET
         d.entries_expired = past_orb_cutoff
 
+        # Maintain the session break latches on EVERY tick, in EVERY state, the
+        # moment the range is established — a break is a session-level fact, not
+        # a property of the ORB entry state machine. This must run BEFORE the
+        # cutoff/OPEN/INVALIDATED early-returns below so that a genuine 1-min
+        # CLOSE beyond a boundary is recorded even when the ORB itself is
+        # dormant (e.g. after a one-sided runaway), which is exactly when the
+        # opposite-side sweep reversal needs the latch. (v1.9)
+        self._update_break_latches(df_1m)
+
         # 11:00 ET HARD cutoff — the ORB window is over. Expire from ANY state,
         # including OPEN_LONG/OPEN_SHORT, so the engine stops watching and can
         # never hold a phantom OPEN past the window. (A real live position is
@@ -235,6 +262,43 @@ class ORBEngine:
                 logger.info("ORB position closed — re-arming for next attempt")
                 self._rearm()
 
+    def _update_break_latches(self, df_1m: pd.DataFrame):
+        """Record, as a session-level fact, whether a 1-min candle has CLOSED
+        beyond the ORB range in each direction (broke_high / broke_low).
+
+        Deliberately independent of the ORB entry state machine: the sweep
+        reversal gate must know a genuine breakout occurred even when the ORB
+        is dormant (post-runaway / timeout / OPEN / EXPIRED), which _before_
+        v1.9 was impossible because the latches were only set inside
+        _check_for_break() (RANGING-only). Uses the SAME closed candle
+        (iloc[-2]) and the SAME break threshold as _check_for_break(), so the
+        latch and the ORB retest arm on identical conditions. Latch-only: sets
+        True and never clears (reset_for_session() is the sole reset). Purely
+        CLOSE-based, so a wick that pokes a boundary and closes back inside
+        does NOT arm a sweep (AVGO-trap protection preserved).
+        """
+        d = self._data
+        if d.orb_high <= 0 or d.orb_low <= 0:
+            return                      # range not established — nothing to latch
+        if df_1m is None or len(df_1m) < 2:
+            return
+        close  = float(df_1m.iloc[-2]["close"])
+        buffer = d.orb_high * ORB_BREAK_BUFFER / 100   # same buffer as _check_for_break
+        if close > d.orb_high + buffer:
+            if not self._broke_high:
+                self._broke_high = True
+                logger.info(
+                    f"ORB latch: 1-min CLOSE {close:.2f} above high "
+                    f"{d.orb_high:.2f} — broke_high armed (session-level)"
+                )
+        elif close < d.orb_low - buffer:
+            if not self._broke_low:
+                self._broke_low = True
+                logger.info(
+                    f"ORB latch: 1-min CLOSE {close:.2f} below low "
+                    f"{d.orb_low:.2f} — broke_low armed (session-level)"
+                )
+
     def _check_for_break(self, df_1m: pd.DataFrame):
         d = self._data
         if df_1m is None or len(df_1m) < 2:
@@ -256,7 +320,8 @@ class ORBEngine:
             d.target_strike      = orb_strike_selection(d.orb_high, d.orb_low, "long", STRIKE_INCREMENT)
             d.attempt_number    += 1
             d.state              = ORBState.BREAK_HIGH_AWAITING_RETEST
-            self._broke_high     = True   # 1-min CLOSE cleared the high — arms sweep (high side)
+            # (v1.9) broke_high is now latched by _update_break_latches() every
+            # tick, independent of state — not set here.
             logger.info(
                 f"ORB BREAK HIGH (attempt #{d.attempt_number}): close={close:.2f} "
                 f"above {d.orb_high:.2f} target={d.target_100pct:.2f} strike={d.target_strike}"
@@ -273,7 +338,8 @@ class ORBEngine:
             d.target_strike      = orb_strike_selection(d.orb_high, d.orb_low, "short", STRIKE_INCREMENT)
             d.attempt_number    += 1
             d.state              = ORBState.BREAK_LOW_AWAITING_RETEST
-            self._broke_low      = True   # 1-min CLOSE cleared the low — arms sweep (low side)
+            # (v1.9) broke_low is now latched by _update_break_latches() every
+            # tick, independent of state — not set here.
             logger.info(
                 f"ORB BREAK LOW (attempt #{d.attempt_number}): close={close:.2f} "
                 f"below {d.orb_low:.2f} target={d.target_100pct:.2f} strike={d.target_strike}"
