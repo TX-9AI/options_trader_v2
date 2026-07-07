@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# options_trader_v2/eod_summary.py — v1.1
+# options_trader_v2/eod_summary.py — v1.2
 """
 End-of-day P&L writer. Runs on EACH bot box at ~15:50 ET (own systemd timer),
 AFTER the 15:45 flatten. Writes a small local JSON that the control server
@@ -36,14 +36,16 @@ sys.path.insert(0, INSTALL_DIR)
 try:
     from query import DB_PATH, INSTRUMENT, PAPER_TRADING, now_et
 except Exception:  # noqa: BLE001
-    from zoneinfo import ZoneInfo
-    _ET = ZoneInfo("US/Eastern")
+    # Fallback with NO tzdata dependency (fresh boxes may lack zoneinfo data).
+    # ET date via fixed EDT offset — matches the '-4 hours' SQL date filter,
+    # and the date is what matters for the daily rollup at 15:50.
+    from datetime import timedelta
     DB_PATH = os.path.join(INSTALL_DIR, "trades.db")
     INSTRUMENT = os.environ.get("OT_INSTRUMENT", "QQQ")
     PAPER_TRADING = os.environ.get("OT_PAPER_TRADING", "True") != "False"
 
     def now_et():
-        return datetime.now(_ET)
+        return datetime.now(timezone.utc) - timedelta(hours=4)
 
 OUT_DIR = os.path.expanduser("~/eod")
 OUT_PATH = os.path.join(OUT_DIR, "pnl_today.json")
