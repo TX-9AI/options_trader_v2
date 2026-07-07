@@ -1,12 +1,26 @@
 """
 risk/session_guard.py — Session boundary enforcement.
+v1.2 — 2026-07-07 — ORB-formation lockout: no entries until the 9:30–9:35 ET
+        opening-range candle has CLOSED (is_orb_complete → time >= 9:35:00).
+        Universal floor across ALL strategies that guarantees nothing fires
+        during the opening candle (9:30:00–9:34:59). Closes the sweep-reversal
+        hole specifically: the sweep's ORB-break gate returns True while the
+        range is still unestablished — i.e. exactly this window — so without
+        this floor a sweep could pass can_enter() and fire pre-9:35. The gate
+        is a FLOOR, not a delay: it opens the instant the range candle closes
+        (9:35:00 sharp), so a break registered on/after that close is
+        unaffected and every strategy that hinges on the opening-range candle
+        still fires on time.
 v1.0 — original release
 v1.1 — 2026-06-27 — use BUTTERFLY_ENTRY_CUTOFF_ET from config (15:00)
         instead of hardcoded 15:30
 
-Entry cutoffs:
-  - Standard strategies (ORB, SweepReversal): 2:00 PM ET
-  - Butterfly: 3:00 PM ET (BUTTERFLY_ENTRY_CUTOFF_ET in config)
+Entry gates (evaluated in order; first failing gate blocks):
+  - RTH — 9:30–16:00 ET, weekdays
+  - ORB-formation lockout — no entries before 9:35 ET (opening range must close)
+  - Hard close — no new entries at/after 15:45 ET
+  - Entry cutoff — Standard (ORB, SweepReversal) 2:00 PM ET; Butterfly 3:00 PM ET
+  - Macro — VIX-crisis lockout
 """
 
 import logging
@@ -14,7 +28,7 @@ from typing import Optional
 from datetime import datetime, time as dtime
 
 from utils.time_utils import (
-    is_rth, is_hard_close_time, is_past_entry_cutoff,
+    is_rth, is_orb_complete, is_hard_close_time, is_past_entry_cutoff,
     now_et, fmt_et_short, seconds_until_rth_open
 )
 from data.macro_data import MacroSnapshot
@@ -47,6 +61,17 @@ class SessionGuard:
         # ── RTH gate ──────────────────────────────────────────────────────────
         if not is_rth():
             return False, f"outside RTH ({fmt_et_short()})"
+
+        # ── ORB-formation lockout ─────────────────────────────────────────────
+        # No entries until the 9:30–9:35 ET opening-range candle has CLOSED.
+        # This is the universal floor for EVERY strategy: the ORB itself cannot
+        # fire pre-9:35 (no established range), but the sweep reversal otherwise
+        # could — its ORB-break gate (_sweep_broke_orb) returns True while the
+        # range is unestablished, i.e. exactly this window. is_orb_complete() is
+        # True at >= 9:35:00, so this OPENS the gate the instant the opening
+        # candle closes and never delays a break registered on/after that close.
+        if not is_orb_complete():
+            return False, f"opening range still forming (<9:35 ET) — no entries ({fmt_et_short()})"
 
         # ── Hard close ────────────────────────────────────────────────────────
         if is_hard_close_time():
