@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# options_trader_v2/eod_summary.py — v1.0
+# options_trader_v2/eod_summary.py — v1.1
 """
 End-of-day P&L writer. Runs on EACH bot box at ~15:50 ET (own systemd timer),
 AFTER the 15:45 flatten. Writes a small local JSON that the control server
@@ -47,6 +47,7 @@ except Exception:  # noqa: BLE001
 
 OUT_DIR = os.path.expanduser("~/eod")
 OUT_PATH = os.path.join(OUT_DIR, "pnl_today.json")
+TRADES_PATH = os.path.join(OUT_DIR, "trades_today.json")
 
 
 def _connect():
@@ -137,13 +138,57 @@ def write_summary(summary):
     return OUT_PATH
 
 
+def dump_trades():
+    """
+    Full detail for today's closed trades — every column, so the control
+    server's harvest can do deep post-mortem (setup, grade, exit_reason,
+    regime/ADX context, premiums, sizing). Returns the list written.
+    """
+    today = now_et().strftime("%Y-%m-%d")
+    payload = {
+        "schema": 1,
+        "date_et": today,
+        "instrument": INSTRUMENT,
+        "paper": bool(PAPER_TRADING),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "trades": [],
+        "open_positions": [],
+    }
+    conn = _connect()
+    if conn is not None:
+        # SELECT * so whatever context columns exist are all captured.
+        closed = conn.execute(
+            """SELECT * FROM trades
+               WHERE status='closed'
+                 AND date(datetime(entry_time, '-4 hours')) = ?
+               ORDER BY entry_time""",
+            (today,),
+        ).fetchall()
+        payload["trades"] = [dict(r) for r in closed]
+        # Any still-open positions (orphans) — useful to see what was left.
+        openp = conn.execute(
+            "SELECT * FROM trades WHERE status='open'"
+        ).fetchall()
+        payload["open_positions"] = [dict(r) for r in openp]
+        conn.close()
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    tmp = TRADES_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+    os.replace(tmp, TRADES_PATH)
+    return payload["trades"]
+
+
 def main(argv):
     summary = compute_summary()
     path = write_summary(summary)
+    trades = dump_trades()
     print(f"[eod_summary] wrote {path}: "
           f"{summary['instrument']} net "
           f"{summary['net_pnl']:+.2f} over {summary['n_trades']} trades, "
           f"orphans={summary['orphans']}")
+    print(f"[eod_summary] wrote {TRADES_PATH}: {len(trades)} full trade rows")
 
     if "--print" in argv:
         print(json.dumps(summary, indent=2))
