@@ -1,0 +1,16 @@
+[Unit]
+Description=Run OPT_Trader candle logger weekdays shortly after the close
+
+[Timer]
+# 16:05 ET on trading weekdays. The America/New_York suffix makes systemd handle
+# EDT/EST correctly even if the box clock is UTC (requires systemd >= 242; AWS
+# Ubuntu 24 ships 255). If your systemd is older, set the box TZ to
+# America/New_York and drop the zone suffix.
+OnCalendar=Mon..Fri 16:05 America/New_York
+# Do NOT catch up a missed run on a later boot — a late run would pull the wrong
+# (or empty) session. The box is up during RTH, so 16:05 is reliably hit.
+Persistent=false
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

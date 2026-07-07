@@ -1,1 +1,19 @@
+[Unit]
+Description=OPT_Trader EOD 1-min candle logger (DXFeed, same feed as fills)
+After=network-online.target
+Wants=network-online.target
 
+[Service]
+Type=oneshot
+# --- adjust these three to match the box (same as your trading unit) ---
+User=ubuntu
+WorkingDirectory=/home/ubuntu/options_trader_v2
+EnvironmentFile=/home/ubuntu/options_trader_v2/.env
+# --- each box logs ONLY its sharded symbols: edit --symbols per box ---
+# SPX (if traded on this box) needs its DXFeed symbol via --symbol-map, e.g.
+#   --symbol-map SPX=SPX      (verify on first run; equities/ETFs need no map)
+ExecStart=/home/ubuntu/options_trader_v2/venv/bin/python -m data.candle_logger \
+    --symbols AMD,UNH,NVDA \
+    --out /var/lib/opt_trader/candles
+
+# candles are written under /var/lib/opt_trader/candles/<YYYY-MM-DD>/<SYMBOL>.csv
