@@ -12,6 +12,12 @@ v1.4 — 2026-07-06 — DEFINITIVE realized-P&L primitive: realized_pnl_today()
         (single source of truth for the daily-loss circuit breaker, status and
         query) with ET-correct session bucketing; today_summary() routed through
         it so displays and the halt can never disagree.
+v1.5 — 2026-07-07 — expiry-aware orphan handling: get_open_trades_live() (open
+        rows not yet expired — 0DTE and weeklies alike, plus unknown-expiry rows
+        kept for safety) and close_expired_open_trades() (auto-close ONLY rows
+        whose expiry date has passed — a weekly with time left is left alone).
+        Keyed on the stored expiry (YYYY-MM-DD), never on entry date, so a
+        multi-day weekly is never mistaken for a same-day ghost.
 """
 
 import logging
@@ -241,6 +247,80 @@ class TradeLogger:
                 "SELECT * FROM trades WHERE status='open' ORDER BY entry_time ASC"
             ).fetchall()
         return [make_record(**dict(r)) for r in rows]
+
+    def get_open_trades_today(self) -> List[TradeRecord]:
+        """Deprecated alias — retained for safety. Prefer get_open_trades_live().
+        A 0DTE bot that also trades weeklies can hold a position across sessions
+        (expiry days out), so 'entered today' is the WRONG liveness test; use
+        expiry instead."""
+        return self.get_open_trades_live()
+
+    @staticmethod
+    def _expiry_date(expiry) -> str:
+        """Normalize a stored expiry to 'YYYY-MM-DD'. Entries store this format
+        already; tolerate a stray full timestamp. Returns '' if unknown."""
+        if not expiry:
+            return ""
+        s = str(expiry).strip()
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return s[:10]
+        try:
+            return datetime.fromisoformat(s).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    def get_open_trades_live(self) -> List[TradeRecord]:
+        """Open rows that have NOT expired — expiry today or later (0DTE AND
+        weeklies), plus any row whose expiry is unknown (kept deliberately: never
+        abandon a possibly-live position). These are what startup recovery
+        resumes managing."""
+        today_et = now_et().strftime("%Y-%m-%d")
+        out = []
+        for r in self.get_open_trades():
+            exp = self._expiry_date(r.get("expiry", ""))
+            if exp == "" or exp >= today_et:
+                out.append(r)
+        return out
+
+    def close_expired_open_trades(
+        self, exit_reason: str = "expired_orphan_autoclosed"
+    ) -> List[TradeRecord]:
+        """Reconcile TRULY EXPIRED orphans only: any status='open' row whose
+        expiry date has passed (expiry < today ET). A weekly still in its life is
+        left ALONE — its expiry is in the future. Rows with an unknown expiry are
+        also left open (never guess a live position dead). Each closed row gets
+        status='closed', an explicit exit_reason, exit_time now, and pnl_usd
+        forced to 0.0 (true settlement is unknowable — flag for manual review) so
+        it leaves 'open' and is never 'recovered' again. Returns the rows closed
+        (for alerting)."""
+        today_et = now_et().strftime("%Y-%m-%d")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE status='open'"
+            ).fetchall()
+            expired = []
+            for r in rows:
+                exp = self._expiry_date(r["expiry"])
+                if exp != "" and exp < today_et:
+                    expired.append(make_record(**dict(r)))
+            if expired:
+                ids = [r["trade_id"] for r in expired]
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"UPDATE trades SET status='closed', "
+                    f"exit_reason=?, exit_time=?, "
+                    f"pnl_usd=COALESCE(pnl_usd, 0.0) "
+                    f"WHERE trade_id IN ({placeholders})",
+                    [exit_reason, ts_for_db(), *ids]
+                )
+        for r in expired:
+            logger.warning(
+                f"Auto-closed EXPIRED orphan {r.get('trade_id','')[:8]} "
+                f"(expiry {self._expiry_date(r.get('expiry',''))}, "
+                f"{str(r.get('option_side','')).upper()} {r.get('strike',0)}) "
+                f"— {exit_reason}"
+            )
+        return expired
 
     def get_session_losses(self) -> int:
         today = now_utc().strftime("%Y-%m-%d")
