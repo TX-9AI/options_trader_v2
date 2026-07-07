@@ -12,6 +12,14 @@ v1.3 — 2026-07-05 — added send_daily_summary(): a deliberate end-of-day P&L
         Fee-adjusted net is the headline number. This is the 5th alert, and
         it is intentional (once/day, not spam). It is a pure formatter: the
         caller (the EOD task) computes the summary dict from the trade DB.
+v1.4 — 2026-07-07 — restart & flatten self-identification: send_startup_alert()
+        carries restart_type ('fresh boot' vs 'service restart'); new
+        send_recovery_alert() (a live position resumed, with box symbol and a
+        CARRIED-overnight flag for a weekly held across sessions),
+        send_orphan_cleared_alert() (expired ghosts swept, starting flat), and
+        send_hard_close_failure_alert() (position still open past 15:45 —
+        retrying to 16:00, needs a manual check). Replaces the old symbol-less
+        raw _send in main.py.
 """
 
 import logging
@@ -44,11 +52,65 @@ class AlertManager:
     # ── 1. Bot started ──────────────────────────────────────────────────────
 
     def send_startup_alert(self, paper: bool, instrument: str,
-                            risk_usd: float, session_limit: int):
+                            risk_usd: float, session_limit: int,
+                            restart_type: str = ""):
         mode = "PAPER" if paper else "LIVE"
+        rt   = f" | {restart_type}" if restart_type else ""
         self._send(
             f"\U0001F680 OptionsBot [{mode}] STARTED | "
-            f"{instrument} | "
+            f"{instrument}{rt} | "
+            f"{fmt_et_short()}"
+        )
+
+    # ── 1b. Open position resumed after a restart ───────────────────────────
+
+    def send_recovery_alert(self, instrument: str, position_desc: str,
+                            contracts: int, entry_premium: float,
+                            total_cost: float, strategy: str,
+                            restart_type: str = "", carried: bool = False):
+        """A LIVE (unexpired) position was found in the DB on startup and is
+        being resumed. Self-identifies the box (instrument) and the restart type.
+        `carried=True` means it survived from a PRIOR session (a weekly held
+        overnight, or a position that leaked past the 15:45 flatten) — surfaced
+        louder because it must be looked at, not just noted."""
+        rt   = f" after {restart_type}" if restart_type else ""
+        head = ("\u26A0\uFE0F OptionsBot CARRIED POSITION (from prior session)"
+                if carried else "\u26A0\uFE0F OptionsBot RESUMED POSITION")
+        self._send(
+            f"{head} | {instrument} | "
+            f"{position_desc} \u00d7{contracts} @ ${entry_premium:.2f} "
+            f"(${total_cost:.2f} at risk) | {strategy}{rt} | now managing | "
+            f"{fmt_et_short()}"
+        )
+
+    # ── 1c. Expired orphans auto-cleared on startup ─────────────────────────
+
+    def send_orphan_cleared_alert(self, instrument: str, descs: list,
+                                  restart_type: str = ""):
+        """Expired open rows (their expiry date had passed) were auto-closed on
+        startup. Distinct from a recovery — nothing live is being managed; the
+        bot is starting flat. P&L on these is unrecorded (settlement unknown)."""
+        n      = len(descs)
+        joined = ", ".join(descs) if descs else "-"
+        rt     = f" after {restart_type}" if restart_type else ""
+        self._send(
+            f"\U0001F9F9 OptionsBot cleared {n} expired orphan(s) | {instrument} | "
+            f"{joined} | expiry had passed — auto-closed{rt} | starting flat | "
+            f"{fmt_et_short()}"
+        )
+
+    # ── 1d. Hard-close (15:45) could not flatten a position ─────────────────
+
+    def send_hard_close_failure_alert(self, instrument: str, trade_ids: list):
+        """A position is STILL OPEN past the 15:45 hard cutoff and the forced
+        close is not completing. The bot keeps retrying every tick until 16:00,
+        but this needs a manual check before the EOD stop, or it becomes an
+        overnight orphan."""
+        ids = ", ".join(str(t)[:8] for t in trade_ids) if trade_ids else "-"
+        self._send(
+            f"\U0001F6A8 HARD CLOSE INCOMPLETE | {instrument} | "
+            f"{len(trade_ids)} position(s) still OPEN past 15:45 — retrying to "
+            f"16:00 | {ids} | MANUAL CHECK before the box is stopped | "
             f"{fmt_et_short()}"
         )
 
