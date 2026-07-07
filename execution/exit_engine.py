@@ -19,6 +19,17 @@ v1.3 — 2026-07-06 — long-option THETA PROTECTION + generalized FVG trail:
         (b) FVG-anchored trailing stop for ALL longs (ORB + Sweep), armed at
             +FVG_TRAIL_ARM_PCT: parks at the far edge of the nearest unfilled
             in-favor 1m FVG (room to continue), runs with the % trail (max wins).
+v1.4 — 2026-07-07 — theta-bleed REWORK (post 07-07 review). The v1.3 check
+        fired on the first green tick: 58 of 77 exits on 07-07 were theta_bleed,
+        median hold 60s (min 9s), each a ~+$19 scratch — capping every trend
+        while the day's entire P&L came from the handful of trades that survived
+        long enough to reach the trail. _theta_bleed is now bounded by four
+        gates: (1) a minimum gain floor (don't scratch a trivial winner),
+        (2) a trail ceiling (once armed, the trail owns the trade — theta goes
+        silent so trends run), (3) a MIN-HOLD blackout after entry so the move
+        can develop, and (4) a corrected per-CALENDAR-day decay projection
+        (v1.3 divided by RTH_MINUTES=390, overstating projected decay ~3.7x).
+        No call sites change — the gates are internal to _theta_bleed.
 
 Exit triggers by strategy:
 
@@ -72,6 +83,14 @@ logger = logging.getLogger(__name__)
 # floor — tighter than the pre-target trail (75%), protecting gains beyond
 # the original target. Used only when no usable 1m FVG is found.
 POST_TARGET_TRAIL_LOCK_PCT = 0.85
+
+# ─── Theta-bleed gates (v1.4) ─────────────────────────────────────────────────
+# Bound the theta-bleed exit to its legitimate job — a small, stalled winner
+# that has had time to develop and still won't reach the trail. Without these
+# the check fires on the first green tick (see v1.4 header note).
+THETA_MIN_HOLD_MIN       = 20      # blackout: no theta exit in the first N min after entry
+THETA_MIN_GAIN_PCT       = 0.10    # gain floor: don't protect a gain smaller than this
+MINUTES_PER_CALENDAR_DAY = 1440    # theta greek is $/share/CALENDAR day (not the 390 RTH min)
 
 
 @dataclass
@@ -409,19 +428,46 @@ class ExitEngine:
     # ─── Long-option theta protection + general FVG trail ─────────────────────
     def _theta_bleed(self, record: TradeRecord, current_premium: float,
                      pnl_pct: float) -> bool:
-        """True when a PROFITABLE long is bleeding to time: the projected theta
-        decay over the next THETA_LOOKAHEAD_MIN minutes would erase the current
-        unrealized gain. Only fires while in profit (direction hasn't gone
-        against us — a losing trade is handled by the stop, not this)."""
-        if pnl_pct <= 0:
+        """True only when a long has EARNED a real, sub-trail gain that time
+        decay is now projected to erase — AND has been given room to develop
+        first. Four gates (see v1.4 header) bound what was previously a
+        first-green-tick guillotine:
+          (1) GAIN FLOOR    — skip a trivial winner (< THETA_MIN_GAIN_PCT).
+          (2) TRAIL CEILING — once up >= FVG_TRAIL_ARM_PCT the trail owns the
+                              trade; theta stays silent so trends run.
+          (3) MIN HOLD      — a THETA_MIN_HOLD_MIN blackout after entry lets the
+                              move develop before the clock can cut it.
+          (4) DECAY vs GAIN — only then, if projected decay over the lookahead
+                              erases the gain, exit. Theta is $/share/CALENDAR
+                              day, so scale the lookahead by 1440 min/day.
+        Active window: held >= THETA_MIN_HOLD_MIN AND gain in
+        [THETA_MIN_GAIN_PCT, FVG_TRAIL_ARM_PCT) AND stalling to theta."""
+        # (1) gain floor — a tiny green is not worth protecting
+        if pnl_pct < THETA_MIN_GAIN_PCT:
             return False
-        theta = abs(float(record.get("current_theta", 0.0) or 0.0))  # $/share/day
+        # (2) trail ceiling — a running trade belongs to the trail, not theta
+        if pnl_pct >= FVG_TRAIL_ARM_PCT:
+            return False
+        # (3) min-hold blackout — give the move room before the clock can cut it
+        entry_time = record.get("entry_time")
+        if not entry_time:
+            return False                       # can't verify hold ⇒ don't cut
+        entry_dt = entry_time if isinstance(entry_time, datetime) else None
+        if entry_dt is None:
+            try:
+                entry_dt = datetime.fromisoformat(str(entry_time))
+            except ValueError:
+                return False
+        if minutes_since(entry_dt) < THETA_MIN_HOLD_MIN:
+            return False
+        # (4) projected decay vs current gain
+        theta = abs(float(record.get("current_theta", 0.0) or 0.0))  # $/share/CAL day
         if theta <= 0:
             return False
         gain_per_share = current_premium - record["entry_premium"]
         if gain_per_share <= 0:
             return False
-        proj_decay = theta * (THETA_LOOKAHEAD_MIN / float(RTH_MINUTES))
+        proj_decay = theta * (THETA_LOOKAHEAD_MIN / MINUTES_PER_CALENDAR_DAY)
         return proj_decay >= gain_per_share
 
     def _update_fvg_trail(self, trade_id: str, current_premium: float,
