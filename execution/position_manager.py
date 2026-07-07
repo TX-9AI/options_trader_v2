@@ -17,6 +17,16 @@ v1.6 — 2026-07-02 — add remove_record() for the broken-wing roll (drops the 
         untested vertical when it is rolled).
 v1.7 — 2026-07-02 — pass realized P&L into record_win/record_loss so the risk
         manager can track NET daily P&L for the daily loss halt.
+v1.8 — 2026-07-07 — set_open_positions(): resume a recovered SET of open rows
+        wholesale (1 normally, 2 for a legged condor) so startup recovery
+        manages exactly the rows that survived stale-orphan reconciliation
+        without dropping a condor leg.
+v1.9 — 2026-07-07 — flatten_all(): durable, complete forced close for the 15:45
+        hard cutoff. Routes EVERY open record (all condor legs) through the full
+        _execute_exit accounting so the DB row is actually marked closed and P&L
+        booked — replacing main.py's old direct place_exit_order() that submitted
+        an order but never wrote status='closed'. Returns trade_ids that failed
+        to close so the caller can retry/escalate.
 """
 
 import logging
@@ -58,6 +68,49 @@ class PositionManager:
     def set_open_position(self, record: TradeRecord):
         """Single-position strategies (ORB, sweep, butterfly): exactly one."""
         self._open_records = [record]
+
+    def set_open_positions(self, records: List[TradeRecord]):
+        """Resume managing a recovered SET of open positions (one for normal
+        strategies, two for a legged condor). Replaces the active set wholesale.
+        Used by startup recovery so the first tick manages exactly the rows that
+        survived stale-orphan reconciliation — without dropping a condor leg."""
+        self._open_records = list(records)
+
+    def flatten_all(self, reason: str, chain=None) -> List[str]:
+        """Force-close EVERY open record through the full exit accounting.
+
+        Unlike a bare exit_engine.place_exit_order() (which submits/simulates an
+        order but never marks the DB row closed), this routes each record through
+        _execute_exit() so status='closed', P&L, the exit alert, trail cleanup
+        and ORB re-arm all happen — the row is genuinely, durably closed. Closes
+        ALL records (both condor legs), not just the first. If a live mark can't
+        be fetched, books at entry premium as a last resort so the row still
+        closes rather than surviving as an orphan (P&L approximate — logged).
+
+        Returns the list of trade_ids that FAILED to close (empty == fully flat),
+        so the 15:45 caller can retry each tick and escalate.
+        """
+        if not self._open_records:
+            self._open_records = self._trade_logger.get_open_trades()
+
+        failed: List[str] = []
+        for record in list(self._open_records):
+            trade_id = record.get("trade_id", "")
+            premium = self._fetch_current_premium(record, chain=chain)
+            if premium is None:
+                premium = float(record.get("entry_premium", 0.0) or 0.0)
+                logger.warning(
+                    f"Flatten {trade_id[:8]}: no live mark — booking at entry "
+                    f"premium (P&L approximate) so the row still closes."
+                )
+            decision = ExitDecision(should_exit=True, exit_reason=reason)
+            if self._execute_exit(record, decision, premium):
+                self._open_records = [r for r in self._open_records
+                                      if r.get("trade_id") != trade_id]
+            else:
+                failed.append(trade_id)
+                logger.error(f"Flatten FAILED for {trade_id[:8]} — will retry")
+        return failed
 
     def add_condor_leg(self, record: TradeRecord):
         """The condor is the ONLY strategy allowed a second concurrent position
