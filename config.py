@@ -104,6 +104,12 @@ RISK_PER_TRADE_USD  = float(os.environ.get("OT_RISK_USD", "200"))
 DAILY_LOSS_LIMIT_USD = float(os.environ.get("OT_DAILY_LOSS_LIMIT", str(RISK_PER_TRADE_USD)))
 MAX_LOSS_PCT        = 0.25
 SESSION_LOSS_LIMIT  = 2
+# Max-loss stop applied to an ADOPTED position (one discovered open at the
+# broker on a LIVE restart with no DB plan). Defaults to the same threshold
+# every strategy already respects, so an adopted position exits at the same
+# "degree of red" our normal stops would have. Long: stop = entry*(1-pct);
+# short: stop = entry*(1+pct).
+ADOPTED_STOP_PCT    = float(os.environ.get("OT_ADOPTED_STOP_PCT", str(MAX_LOSS_PCT)))
 
 # ─── PAPER TRADING ────────────────────────────────────────────────────────────
 
