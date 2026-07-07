@@ -1,5 +1,5 @@
 """
-main.py — options_trader v2.2
+main.py — options_trader v2.11
 v1.0 — original release
 v2.2 — 2026-07-01 — iron condor legged entry, BB-anchored strikes,
         regime-flip exits, ORB range via get_orb_range.py/orb_range.json,
@@ -15,6 +15,15 @@ v2.4 — 2026-07-02 — remove duplicate _execute_condor_leg (dead 2-arg def sha
         unit-file parsing).
 v2.10 — 2026-07-02 — directional-only instruments (single names): skip iron
         condor and butterfly in the dispatch; ORB + sweep only.
+v2.11 — 2026-07-07 — durable 15:45 flatten + expiry-aware recovery. handle_hard_
+        close now routes through pos_mgr.flatten_all() so EVERY open record
+        (both condor legs) is truly closed in the DB + P&L booked (the old path
+        called place_exit_order directly and never wrote status='closed'),
+        retries every tick to 16:00, and pages once on failure. Startup recovery
+        keys on EXPIRY, not entry date (the bot trades weeklies): sweep only
+        genuinely expired orphans, resume every still-live row, and flag a
+        CARRIED-overnight position. Restart alerts self-identify (box symbol +
+        fresh-boot vs service-restart from /proc/uptime).
 v2.9 — 2026-07-02 — block new entries when the daily loss halt is active
         (day P&L <= -DAILY_LOSS_LIMIT_USD); open positions still exit.
 v2.8 — 2026-07-02 — (2a) ORB-window sweep override: when an ORB signal fires but
@@ -112,7 +121,6 @@ from risk.setup_scorer import get_setup_scorer
 from risk.session_guard import get_session_guard
 
 from execution.entry_engine import get_entry_engine
-from execution.exit_engine import get_exit_engine
 from execution.position_manager import get_position_manager
 
 from database.trade_logger import get_trade_logger
@@ -137,6 +145,7 @@ class BotState:
         self.session_reset_done: bool = False   # Reset once per RTH open
         self.orb_reset_done:   bool = False     # ORB reset once per session
         self.orb_range_established_today: bool = False  # today's ORB range ESTABLISHED
+        self.hard_close_alerted: bool = False   # alerted once on a failed 15:45 flatten
 
 
 def run_analysis(state: BotState) -> dict:
@@ -594,20 +603,35 @@ def handle_session_reset(state: BotState):
 
 
 def handle_hard_close(state: BotState):
-    """Force-close open position at 15:45 ET."""
+    """Force-close every open position at 15:45 ET — durably.
+
+    Routes through pos_mgr.flatten_all(), which closes ALL open records (both
+    condor legs) via the full exit accounting so each DB row is actually marked
+    closed and booked — not just an order submitted. The main loop calls this
+    every tick from 15:45 to 16:00, so an incomplete close is retried
+    automatically; a persistent failure pages once (before the 16:00 stop turns
+    it into an overnight orphan).
+    """
     pos_mgr = get_position_manager(state.paper_trading)
     if not pos_mgr.has_open_position():
+        state.hard_close_alerted = False   # nothing open — clear any prior page
         return
 
-    record = pos_mgr.get_open_record()
-    if record:
-        logger.warning(
-            f"HARD CLOSE: forcing exit of {record.get('trade_id','')[:8]} "
-            f"at 15:45 ET"
-        )
-        get_exit_engine(state.paper_trading).place_exit_order(
-            record, "hard_close_15:45_ET"
-        )
+    instrument = os.environ.get("OT_INSTRUMENT", INSTRUMENT)
+    failed = pos_mgr.flatten_all("hard_close_15:45_ET")
+
+    if not failed:
+        logger.info("HARD CLOSE complete — all positions flat.")
+        state.hard_close_alerted = False
+        return
+
+    logger.error(
+        f"HARD CLOSE INCOMPLETE [{instrument}]: {len(failed)} still open "
+        f"{[t[:8] for t in failed]} — retrying every tick until 16:00"
+    )
+    if not state.hard_close_alerted:
+        get_alert_manager().send_hard_close_failure_alert(instrument, failed)
+        state.hard_close_alerted = True
 
 
 def main_loop(state: BotState):
@@ -742,65 +766,115 @@ def main_loop(state: BotState):
         time.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
 
 
-def _recover_open_position(state: BotState):
-    """
-    Called immediately on every start, restart, and reboot.
-    Checks the database for any open position and resumes managing it
-    before the main loop begins. Non-negotiable — if money is on the
-    line, the bot must be aware of it within seconds of coming online.
-    """
-    pos_mgr = get_position_manager(state.paper_trading)
+# Below this many seconds of system uptime, a startup is treated as a fresh
+# instance boot (EC2 stop/start or reboot); above it, a service-only restart
+# (systemctl restart / crash / deploy while the box was already up).
+BOOT_UPTIME_THRESHOLD_S = 180
 
-    if not pos_mgr.has_open_position():
-        logger.info("Startup position check: no open positions found.")
-        return
 
-    record = pos_mgr.get_open_record()
-    if not record:
-        return
+def _boot_kind() -> str:
+    """Classify why the bot just started, for restart self-identification.
+    Fresh instance boot vs service-only restart, read from /proc/uptime.
+    Best-effort: returns a generic 'restart' if uptime can't be read."""
+    try:
+        with open("/proc/uptime") as fh:
+            uptime_s = float(fh.read().split()[0])
+        return "fresh boot" if uptime_s < BOOT_UPTIME_THRESHOLD_S else "service restart"
+    except Exception:
+        return "restart"
 
-    trade_id     = record.get("trade_id", "")[:8]
-    strategy     = record.get("strategy", "")
-    option_side  = record.get("option_side", "").upper()
-    strike       = record.get("strike", 0)
-    contracts    = record.get("contracts", 0)
-    entry_prem   = record.get("entry_premium", 0)
-    total_cost   = record.get("total_cost", 0)
-    is_butterfly = bool(record.get("is_butterfly", 0))
-    entry_time   = record.get("entry_time", "")
 
-    if is_butterfly:
-        position_desc = (
-            f"BUTTERFLY {record.get('option_side','').upper()} "
+def _describe_position(record: dict) -> str:
+    """One-line, self-identifying description of an open row (used by both the
+    recovery alert and the stale-orphan sweep alert)."""
+    side = str(record.get("option_side", "")).upper()
+    if bool(record.get("is_butterfly", 0)):
+        return (
+            f"BUTTERFLY {side} "
             f"{record.get('lower_strike',0):.0f}/"
             f"{record.get('center_strike',0):.0f}/"
             f"{record.get('upper_strike',0):.0f}"
         )
-    else:
-        position_desc = f"{option_side} {strike:.0f}"
+    if record.get("is_condor_leg") or record.get("strategy") == "IronCondorStrategy":
+        return (f"CONDOR {side} "
+                f"{record.get('short_strike',0):.0f}/{record.get('long_strike',0):.0f}")
+    return f"{side} {record.get('strike',0):.0f}"
+
+
+def _recover_open_position(state: BotState, restart_type: str = ""):
+    """
+    Called immediately on every start, restart, and reboot, before the main loop.
+
+    Step 1 — reconcile only TRULY EXPIRED orphans. A position's liveness is its
+    EXPIRY, not its entry date: this bot also trades weeklies (nearest expiry can
+    be days out), so a row entered on a prior session may still be a live
+    contract today. Only rows whose expiry has actually passed are dead; those
+    are closed in the DB up front so nothing manages a ghost.
+
+    Step 2 — resume EVERY still-live open row (0DTE or weekly). If a position
+    survived overnight (a weekly held, or one that leaked past the 15:45 flatten
+    / a hard kill), it is identified and managed immediately, and flagged as
+    CARRIED so it can't be missed.
+    """
+    pos_mgr = get_position_manager(state.paper_trading)
+    trade_logger = get_trade_logger()
+    instrument = os.environ.get("OT_INSTRUMENT", INSTRUMENT)
+
+    # ── Step 1: sweep only genuinely EXPIRED orphans ─────────────────────────
+    expired = trade_logger.close_expired_open_trades()
+    if expired:
+        descs = [_describe_position(r) for r in expired]
+        logger.warning(
+            f"Startup: auto-closed {len(expired)} EXPIRED orphan(s) [{instrument}]: "
+            f"{', '.join(descs)}"
+        )
+        get_alert_manager().send_orphan_cleared_alert(
+            instrument=instrument, descs=descs, restart_type=restart_type
+        )
+
+    # ── Step 2: resume every still-live (unexpired) position ─────────────────
+    live = trade_logger.get_open_trades_live()
+    if not live:
+        logger.info("Startup position check: no live positions to resume.")
+        return
+
+    pos_mgr.set_open_positions(live)
+
+    # A position whose entry ET date is before today survived a session boundary.
+    today_et = now_et().strftime("%Y-%m-%d")
+    carried  = any(
+        trade_logger._et_date(r.get("entry_time", "")) not in ("", today_et)
+        for r in live
+    )
+
+    descs         = [_describe_position(r) for r in live]
+    position_desc = " + ".join(descs)
+    contracts     = sum(int(r.get("contracts", 0) or 0) for r in live)
+    total_cost    = sum(float(r.get("total_cost", 0) or 0) for r in live)
+    lead          = live[0]
+    entry_prem    = float(lead.get("entry_premium", 0) or 0)
+    strategy      = lead.get("strategy", "")
+    trade_ids     = ",".join(r.get("trade_id", "")[:8] for r in live)
 
     logger.warning(
-        f"⚠️  OPEN POSITION DETECTED ON STARTUP: "
-        f"{position_desc} x{contracts} "
+        f"⚠️  {'CARRIED' if carried else 'LIVE'} POSITION RECOVERED ON STARTUP "
+        f"[{instrument}]: {position_desc} x{contracts} "
         f"entry=${entry_prem:.2f} total=${total_cost:.2f} "
-        f"strategy={strategy} id={trade_id} "
-        f"entered={entry_time}"
+        f"strategy={strategy} id={trade_ids} ({restart_type or 'restart'})"
     )
-
-    # Alert operator immediately — money is on the line
-    get_alert_manager()._send(
-        f"⚠️ BOT RESTARTED WITH OPEN POSITION: "
-        f"{position_desc} x{contracts} "
-        f"@ ${entry_prem:.2f}/share (${total_cost:.2f} at risk) | "
-        f"{strategy} | Now managing."
+    get_alert_manager().send_recovery_alert(
+        instrument   = instrument,
+        position_desc = position_desc,
+        contracts    = contracts,
+        entry_premium = entry_prem,
+        total_cost   = total_cost,
+        strategy     = strategy,
+        restart_type = restart_type,
+        carried      = carried,
     )
-
-    # Set the position in the position manager so the main loop
-    # picks it up immediately on the very first tick
-    pos_mgr.set_open_position(record)
     logger.info(
-        f"Position recovery complete — "
-        f"main loop will manage {position_desc} from first tick."
+        f"Position recovery complete — main loop will manage "
+        f"{position_desc} from first tick."
     )
 
 
@@ -880,11 +954,16 @@ def main():
     logger.info("Fetching macro data...")
     get_macro_manager().get(force=True)
 
+    # Classify this start (fresh instance boot vs service restart) so every
+    # alert below can self-identify what kind of restart just happened.
+    restart_type = _boot_kind()
+
     get_alert_manager().send_startup_alert(
         paper      = session_config.paper_trading,
         instrument = session_config.instrument,
         risk_usd   = session_config.risk_per_trade_usd,
-        session_limit = SESSION_LOSS_LIMIT
+        session_limit = SESSION_LOSS_LIMIT,
+        restart_type = restart_type,
     )
 
     # ── Graceful shutdown alert on SIGTERM/SIGINT ────────────────────────────
@@ -909,7 +988,7 @@ def main():
     # Runs before the main loop on every start, restart, or reboot.
     # If the bot went down with money on the line, we resume managing
     # that position within seconds — not waiting for the first loop cycle.
-    _recover_open_position(state)
+    _recover_open_position(state, restart_type)
 
     # ── Fetch ORB range on start/restart ─────────────────────────────────────
     # Runs unconditionally: get_orb_range.py always writes the last valid range
