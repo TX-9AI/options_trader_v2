@@ -20,6 +20,10 @@
 #         if the operator pastes a full URL instead of "owner/repo"
 # v3.0 — 2026-07-05 — chmod +x moved to after git reset --hard so git never
 #         strips execute bits; now covers all .sh files recursively
+# v3.1 — 2026-07-07 — call harden_hosts.sh during setup: block needrestart from
+#         auto-restarting optionsbot after package upgrades, and move the
+#         apt-daily/apt-daily-upgrade timers out of RTH (Persistent=false).
+#         Fixes mid-session restarts caused by unattended-upgrades -> needrestart.
 #
 # QQQ/SPX 0DTE | TastyTrade OAuth | Telegram alerts
 # =============================================================================
@@ -257,6 +261,20 @@ SVCEOF
 sudo chmod 600 /etc/systemd/system/${SERVICE_NAME}.service
 sudo systemctl daemon-reload
 sudo systemctl enable ${SERVICE_NAME}
+
+# ── Host hardening ────────────────────────────────────────────────────────────
+# Stop package upgrades (unattended-upgrades -> needrestart) from restarting the
+# bot mid-session, and move the apt schedule out of RTH. See harden_hosts.sh.
+# Invoked with `bash` so it runs before the chmod +x pass later in this script.
+if [ -f "$INSTALL_DIR/harden_hosts.sh" ]; then
+    if bash "$INSTALL_DIR/harden_hosts.sh"; then
+        print_ok "Host hardening applied (needrestart shield + apt timers off-RTH)."
+    else
+        print_warn "harden_hosts.sh reported an issue — review before market open."
+    fi
+else
+    print_warn "harden_hosts.sh not found in ${INSTALL_DIR} — host hardening SKIPPED."
+fi
 
 touch "$INSTALL_DIR/bot.log" "$INSTALL_DIR/trades.db"
 chown "${USER}:${USER}" "$INSTALL_DIR/bot.log" "$INSTALL_DIR/trades.db"
