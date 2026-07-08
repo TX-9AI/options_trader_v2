@@ -5,15 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# --- adjust these three to match the box (same as your trading unit) ---
+# ── Set these to MATCH this box's trading unit (copy from optionsbot.service) ──
 User=ubuntu
 WorkingDirectory=/home/ubuntu/options_trader_v2
+# The logger needs the SAME environment as the bot: Tastytrade creds (for the
+# DXLink session) AND OT_INSTRUMENT (so it defaults to this box's symbol). Point
+# this at the same source your bot uses. If your bot keeps its env INLINE in its
+# systemd unit rather than a file, copy those Environment= lines in here instead.
 EnvironmentFile=/home/ubuntu/options_trader_v2/.env
-# --- each box logs ONLY its sharded symbols: edit --symbols per box ---
-# SPX (if traded on this box) needs its DXFeed symbol via --symbol-map, e.g.
-#   --symbol-map SPX=SPX      (verify on first run; equities/ETFs need no map)
-ExecStart=/home/ubuntu/options_trader_v2/venv/bin/python -m data.candle_logger \
-    --symbols AMD,UNH,NVDA \
-    --out /var/lib/opt_trader/candles
+# No --symbols / --out needed: defaults to this box's OT_INSTRUMENT, written to
+# <repo>/data/OHLC/<YYYY-MM-DD>/<SYMBOL>.csv. On an SPX box, append the map:
+#   ... -m data.candle_logger --symbol-map SPX=SPX
+ExecStart=/home/ubuntu/options_trader_v2/venv/bin/python -m data.candle_logger
 
-# candles are written under /var/lib/opt_trader/candles/<YYYY-MM-DD>/<SYMBOL>.csv
+# Output: <WorkingDirectory>/data/OHLC/<YYYY-MM-DD>/<SYMBOL>.csv
