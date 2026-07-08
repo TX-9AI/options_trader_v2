@@ -24,6 +24,13 @@ v2.11 — 2026-07-07 — durable 15:45 flatten + expiry-aware recovery. handle_h
         genuinely expired orphans, resume every still-live row, and flag a
         CARRIED-overnight position. Restart alerts self-identify (box symbol +
         fresh-boot vs service-restart from /proc/uptime).
+v2.12 — 2026-07-07 — LIVE broker reconciliation wired into recovery: the broker
+        is the source of truth for existence. _reconcile_with_broker() queries
+        open positions, KEEPs DB-planned rows confirmed there, ADOPTs+journals
+        broker positions with no DB plan (managed by the ADOPTED exit path),
+        and closes PHANTOM DB rows the broker no longer shows. FAIL-SAFE: a
+        failed or empty broker read never closes anything — falls back to
+        DB-only recovery. Paper is unchanged (no broker query).
 v2.9 — 2026-07-02 — block new entries when the daily loss halt is active
         (day P&L <= -DAILY_LOSS_LIMIT_USD); open positions still exit.
 v2.8 — 2026-07-02 — (2a) ORB-window sweep override: when an ORB signal fires but
@@ -65,7 +72,7 @@ from config import (
     POLL_INTERVAL_SECONDS, LOG_LEVEL, LOG_FILE, LOG_ROTATION_MB,
     PAPER_TRADING, RISK_PER_TRADE_USD, SESSION_LOSS_LIMIT,
     REGIME_REASSESS_MINUTES, INSTRUMENT, SessionConfig, DIRECTIONAL_ONLY,
-    NO_ENTRY_AFTER_ET
+    NO_ENTRY_AFTER_ET, BROKER_RECONCILE_ENABLED
 )
 
 
@@ -801,6 +808,68 @@ def _describe_position(record: dict) -> str:
     return f"{side} {record.get('strike',0):.0f}"
 
 
+def _reconcile_with_broker(state: BotState, live_rows: list,
+                           restart_type: str, instrument: str) -> list:
+    """
+    LIVE-only: reconcile the DB's live rows against the broker, which is the
+    source of truth for whether a position EXISTS. Returns the final list of
+    records to manage (kept DB rows + adopted broker positions). Journals adopts,
+    closes phantoms, and alerts.
+
+    FAIL-SAFE: on ANY broker read failure — or an empty read while the DB still
+    shows live rows — return the DB rows unchanged and close NOTHING. A bad or
+    empty read must never be interpreted as "the broker is flat", which would
+    close real positions.
+    """
+    trade_logger = get_trade_logger()
+    try:
+        from data.tasty_client import get_open_option_positions
+        broker = get_open_option_positions()
+    except Exception as e:
+        logger.error(f"Broker reconcile unavailable ({e}) — DB-only recovery, closed nothing.")
+        get_alert_manager().send_reconcile_unavailable_alert(instrument, "read failed")
+        return live_rows
+
+    if not broker:
+        if live_rows:
+            logger.warning(
+                "Broker returned NO option positions while the DB shows live rows — "
+                "inconclusive; DB-only recovery, closed nothing."
+            )
+            get_alert_manager().send_reconcile_unavailable_alert(instrument, "empty read")
+        return live_rows
+
+    from execution.broker_reconcile import build_plan
+    plan = build_plan(broker, live_rows)
+
+    # Phantoms: open in our DB but absent at the broker -> close (broker wins).
+    for tid in plan.close_phantom:
+        trade_logger.close_phantom(tid)
+    if plan.close_phantom:
+        get_alert_manager().send_phantom_closed_alert(instrument, plan.close_phantom)
+
+    # Adopts: journal into our system of record + alert (loud for a lone short).
+    anomaly_ids = set(plan.anomalies)
+    for rec in plan.adopt:
+        trade_logger.log_entry(rec)
+        get_alert_manager().send_adopted_alert(
+            instrument    = instrument,
+            position_desc = _describe_position(rec),
+            contracts     = int(rec.get("contracts", 0) or 0),
+            entry_premium = float(rec.get("entry_premium", 0) or 0),
+            is_short      = bool(rec.get("is_short_position")),
+            anomaly       = rec.get("trade_id") in anomaly_ids,
+            restart_type  = restart_type,
+        )
+        logger.warning(
+            f"ADOPTED [{instrument}] {_describe_position(rec)} "
+            f"({'short' if rec.get('is_short_position') else 'long'}) "
+            f"id={rec.get('trade_id','')[:8]}"
+        )
+
+    return list(plan.keep) + list(plan.adopt)
+
+
 def _recover_open_position(state: BotState, restart_type: str = ""):
     """
     Called immediately on every start, restart, and reboot, before the main loop.
@@ -834,27 +903,42 @@ def _recover_open_position(state: BotState, restart_type: str = ""):
 
     # ── Step 2: resume every still-live (unexpired) position ─────────────────
     live = trade_logger.get_open_trades_live()
+
+    # LIVE ONLY, and only when explicitly enabled: the broker is the source of
+    # truth for what's actually open. (Paper has no broker to query; and even on
+    # live this stays OFF until OT_BROKER_RECONCILE=True, so it can't fire before
+    # get_open_option_positions() has been verified on a live box.)
+    if not state.paper_trading and BROKER_RECONCILE_ENABLED:
+        live = _reconcile_with_broker(state, live, restart_type, instrument)
+
     if not live:
         logger.info("Startup position check: no live positions to resume.")
         return
 
     pos_mgr.set_open_positions(live)
 
+    # The recovery/carried alert covers DB-PLANNED rows only; adopted positions
+    # already got their own adopted alerts inside the reconcile.
+    db_planned = [r for r in live if r.get("strategy") != "ADOPTED"]
+    if not db_planned:
+        logger.info("Recovery: only adopted positions to manage (already alerted).")
+        return
+
     # A position whose entry ET date is before today survived a session boundary.
     today_et = now_et().strftime("%Y-%m-%d")
     carried  = any(
         trade_logger._et_date(r.get("entry_time", "")) not in ("", today_et)
-        for r in live
+        for r in db_planned
     )
 
-    descs         = [_describe_position(r) for r in live]
+    descs         = [_describe_position(r) for r in db_planned]
     position_desc = " + ".join(descs)
-    contracts     = sum(int(r.get("contracts", 0) or 0) for r in live)
-    total_cost    = sum(float(r.get("total_cost", 0) or 0) for r in live)
-    lead          = live[0]
+    contracts     = sum(int(r.get("contracts", 0) or 0) for r in db_planned)
+    total_cost    = sum(float(r.get("total_cost", 0) or 0) for r in db_planned)
+    lead          = db_planned[0]
     entry_prem    = float(lead.get("entry_premium", 0) or 0)
     strategy      = lead.get("strategy", "")
-    trade_ids     = ",".join(r.get("trade_id", "")[:8] for r in live)
+    trade_ids     = ",".join(r.get("trade_id", "")[:8] for r in db_planned)
 
     logger.warning(
         f"⚠️  {'CARRIED' if carried else 'LIVE'} POSITION RECOVERED ON STARTUP "

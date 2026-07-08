@@ -110,6 +110,11 @@ SESSION_LOSS_LIMIT  = 2
 # "degree of red" our normal stops would have. Long: stop = entry*(1-pct);
 # short: stop = entry*(1+pct).
 ADOPTED_STOP_PCT    = float(os.environ.get("OT_ADOPTED_STOP_PCT", str(MAX_LOSS_PCT)))
+# Master switch for LIVE broker<->DB position reconciliation (adopt / keep /
+# phantom-close). Default OFF: even on live, reconciliation stays dormant until
+# the operator has verified get_open_option_positions() output on a live box and
+# explicitly enables it via OT_BROKER_RECONCILE=True. Paper never reconciles.
+BROKER_RECONCILE_ENABLED = os.environ.get("OT_BROKER_RECONCILE", "False") == "True"
 
 # ─── PAPER TRADING ────────────────────────────────────────────────────────────
 
