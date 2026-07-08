@@ -6,6 +6,9 @@ v1.0 — 2026-07-07 — initial: the brokerage is the source of truth for whethe
         rows. Pure logic (no SDK, no DB writes) so it is fully unit-testable; the
         caller performs the DB writes and alerts. PAPER never calls this — the DB
         is truth there.
+v1.1 — 2026-07-07 — leg_roles(): split a record's option symbols into (short,
+        long) so an intraday reconcile can detect a broker-closed SHORT leg
+        while the long remains (build_plan only checks any-leg presence).
 
 Rules (agreed design):
   - A broker position already represented by a LIVE DB row  -> KEEP (manage from
@@ -180,3 +183,31 @@ def build_plan(broker_positions: List[dict], db_live_rows: List[dict]) -> Reconc
         plan.adopt.append(rec)
 
     return plan
+
+
+def leg_roles(record: dict) -> tuple:
+    """Split a record's option symbols into (short_syms, long_syms) by role, so
+    an intraday reconcile can distinguish a broker-closed SHORT leg from a closed
+    long. Covers condor legs (short_symbol/long_symbol), butterflies (center is
+    the short, wings are long), adopted shorts (is_short_position), and plain
+    long singles. Returns (set, set)."""
+    short, long = set(), set()
+    is_condor = (bool(record.get("is_condor_leg"))
+                 or record.get("strategy") == "IronCondorStrategy")
+    if is_condor:
+        if record.get("short_symbol"):
+            short.add(record["short_symbol"])
+        if record.get("long_symbol"):
+            long.add(record["long_symbol"])
+        return short, long
+    if record.get("is_butterfly"):
+        if record.get("center_symbol"):
+            short.add(record["center_symbol"])
+        for k in ("lower_symbol", "upper_symbol"):
+            if record.get(k):
+                long.add(record[k])
+        return short, long
+    sym = record.get("option_symbol")
+    if sym:
+        (short if record.get("is_short_position") else long).add(sym)
+    return short, long
