@@ -106,6 +106,62 @@ def get_account_number() -> str:
     return get_tt_account_number()
 
 
+def get_open_option_positions() -> list:
+    """
+    LIVE broker option positions, normalized for reconciliation (see
+    execution/broker_reconcile.py). Returns a list of dicts:
+        {symbol, underlying, quantity, direction, average_open_price}
+    for OPEN option legs only (quantity != 0). The brokerage is the source of
+    truth for whether a position exists; this is how we ask it.
+
+    NEVER call on paper — there is no broker to query. Raises TastyClientError
+    on failure so the caller can fall back to DB-only rather than trade blind.
+
+    Version-robust: Account.get_positions is synchronous on tastytrade 12.x but
+    a coroutine on 13.x — we detect and run it on the background loop if needed.
+
+    NOTE: field access is verified against tastytrade 13.0.0 and the stable 12.x
+    fields, but the deployed pin is >=12.4.0 — run this once against a live box
+    and eyeball the output before relying on it for real orders.
+    """
+    account = get_account()
+    session = get_session()
+    try:
+        raw = account.get_positions(session)
+        if asyncio.iscoroutine(raw):
+            raw = run_async(raw)
+    except Exception as e:
+        raise TastyClientError(f"get_positions failed: {e}") from e
+
+    out = []
+    for p in raw or []:
+        try:
+            itype = getattr(p, "instrument_type", "")
+            itype = getattr(itype, "value", itype)          # enum -> str if needed
+            if "Option" not in str(itype):
+                continue                                     # options only
+            qty = int(abs(float(getattr(p, "quantity", 0) or 0)))
+            direction = str(getattr(p, "quantity_direction", "") or "")
+            if qty == 0 or direction.lower() == "zero":
+                continue                                     # closed leg
+            out.append({
+                "symbol":             getattr(p, "symbol", "") or "",
+                "underlying":         getattr(p, "underlying_symbol", "") or "",
+                "quantity":           qty,
+                "direction":          direction,             # 'Long' / 'Short'
+                "average_open_price": float(getattr(p, "average_open_price", 0) or 0),
+            })
+        except Exception as e:
+            logger.error(
+                f"Skipping unparseable broker position "
+                f"{getattr(p, 'symbol', '?')}: {e}"
+            )
+            continue
+
+    logger.info(f"Broker reports {len(out)} open option position(s)")
+    return out
+
+
 def reset_session():
     """Force a new session and account to be created on the next call."""
     global _session, _account
