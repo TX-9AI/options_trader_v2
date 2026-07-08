@@ -1,0 +1,49 @@
+# Secrets — never commit these
+credentials.py
+cred.txt
+# One-shot deploy bootstrap holding real secrets — never commit. Any bootstrap*.sh
+# is ignored EXCEPT the placeholder template, which is the committed reference.
+bootstrap*.sh
+!bootstrap.example.sh
+*.pem
+*.key
+*.env
+
+# Database and logs — generated at runtime
+trades.db
+bot.log
+*.log
+*.log.*
+*.db-shm
+*.db-wal
+
+# Candle logger output — generated at runtime (in-project data dir)
+data/OHLC/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.tar
+*.tar.gz
+*.ziptrades.db-shm
+trades.db-wal
+orb_range.json echo analysis/orb_range.json
+orb_range.json
+orb_state.json
