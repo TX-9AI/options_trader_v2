@@ -20,6 +20,12 @@ v1.4 — 2026-07-07 — restart & flatten self-identification: send_startup_aler
         send_hard_close_failure_alert() (position still open past 15:45 —
         retrying to 16:00, needs a manual check). Replaces the old symbol-less
         raw _send in main.py.
+v1.5 — 2026-07-07 — broker-reconcile alerts: send_adopted_alert() (a position
+        discovered open at the broker with no DB plan, now adopted+managed; a
+        lone short raises it to a loud anomaly), send_phantom_closed_alert()
+        (DB rows the broker no longer shows, closed), and
+        send_reconcile_unavailable_alert() (broker read failed/empty — fell back
+        to DB-only recovery, closed nothing).
 """
 
 import logging
@@ -111,6 +117,53 @@ class AlertManager:
             f"\U0001F6A8 HARD CLOSE INCOMPLETE | {instrument} | "
             f"{len(trade_ids)} position(s) still OPEN past 15:45 — retrying to "
             f"16:00 | {ids} | MANUAL CHECK before the box is stopped | "
+            f"{fmt_et_short()}"
+        )
+
+    # ── 1e. Broker reconciliation (LIVE) ────────────────────────────────────
+
+    def send_adopted_alert(self, instrument: str, position_desc: str,
+                           contracts: int, entry_premium: float,
+                           is_short: bool = False, anomaly: bool = False,
+                           restart_type: str = ""):
+        """A position was found open at the broker with no DB plan and has been
+        adopted + is now managed on its own merit. A lone short (anomaly=True) is
+        raised to a loud 🚨 — per the account's margin reality it should be
+        near-impossible, so it warrants eyes."""
+        rt   = f" after {restart_type}" if restart_type else ""
+        side = "SHORT" if is_short else "long"
+        if anomaly:
+            self._send(
+                f"\U0001F6A8 ADOPTED LONE SHORT (anomaly) | {instrument} | "
+                f"{position_desc} \u00d7{contracts} @ ${entry_premium:.2f} | "
+                f"no defining long found — managing on its own merit{rt} | "
+                f"CHECK margin/broker | {fmt_et_short()}"
+            )
+        else:
+            self._send(
+                f"\U0001F91D OptionsBot ADOPTED POSITION ({side}) | {instrument} | "
+                f"{position_desc} \u00d7{contracts} @ ${entry_premium:.2f} | "
+                f"no DB plan — now managing{rt} | {fmt_et_short()}"
+            )
+
+    def send_phantom_closed_alert(self, instrument: str, trade_ids: list):
+        """DB rows the broker no longer shows open, closed (broker wins on
+        existence). Informational — we stopped managing positions that aren't
+        actually there."""
+        ids = ", ".join(str(t)[:8] for t in trade_ids) if trade_ids else "-"
+        self._send(
+            f"\U0001F9F9 Closed {len(trade_ids)} phantom(s) | {instrument} | "
+            f"{ids} | in DB but not at broker | {fmt_et_short()}"
+        )
+
+    def send_reconcile_unavailable_alert(self, instrument: str, reason: str = ""):
+        """The broker position read failed or came back empty while the DB shows
+        live rows. We fell back to DB-only recovery and closed NOTHING — never
+        treat a bad read as 'broker is flat'."""
+        why = f" ({reason})" if reason else ""
+        self._send(
+            f"\u26A0\uFE0F Broker reconcile unavailable{why} | {instrument} | "
+            f"DB-only recovery, no positions closed | verify manually | "
             f"{fmt_et_short()}"
         )
 
