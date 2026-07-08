@@ -18,6 +18,10 @@ v1.5 — 2026-07-07 — expiry-aware orphan handling: get_open_trades_live() (op
         whose expiry date has passed — a weekly with time left is left alone).
         Keyed on the stored expiry (YYYY-MM-DD), never on entry date, so a
         multi-day weekly is never mistaken for a same-day ghost.
+v1.6 — 2026-07-07 — broker reconciliation support: is_short_position column
+        (schema + migration) so an adopted short survives a re-restart; and
+        close_phantom() to close a DB row the broker no longer shows (broker is
+        the source of truth for existence on live).
 """
 
 import logging
@@ -89,6 +93,7 @@ class TradeLogger:
         is_condor_leg     INTEGER DEFAULT 0,
         condor_leg_num    INTEGER DEFAULT 0,
         is_broken_wing    INTEGER DEFAULT 0,
+        is_short_position INTEGER DEFAULT 0,
         short_symbol      TEXT,
         long_symbol       TEXT,
         pnl_usd           REAL,
@@ -151,6 +156,7 @@ class TradeLogger:
             ("is_broken_wing",  "INTEGER DEFAULT 0"),
             ("short_symbol",    "TEXT"),
             ("long_symbol",     "TEXT"),
+            ("is_short_position", "INTEGER DEFAULT 0"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
@@ -321,6 +327,21 @@ class TradeLogger:
                 f"— {exit_reason}"
             )
         return expired
+
+    def close_phantom(self, trade_id: str,
+                      reason: str = "phantom_closed_at_broker") -> None:
+        """Close a DB row the broker no longer shows open. On LIVE, the broker is
+        the source of truth for existence: if a row is open in our DB but absent
+        at the broker, it has closed there (or never truly filled) and we must
+        stop 'managing' it. pnl_usd is forced to 0.0 (the real fill is unknown —
+        flag for review) with an explicit reason."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET status='closed', exit_reason=?, exit_time=?, "
+                "pnl_usd=COALESCE(pnl_usd, 0.0) WHERE trade_id=?",
+                (reason, ts_for_db(), trade_id),
+            )
+        logger.warning(f"Closed phantom {trade_id[:8]} — {reason}")
 
     def get_session_losses(self) -> int:
         today = now_utc().strftime("%Y-%m-%d")
