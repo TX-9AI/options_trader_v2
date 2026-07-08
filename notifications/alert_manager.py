@@ -26,6 +26,9 @@ v1.5 — 2026-07-07 — broker-reconcile alerts: send_adopted_alert() (a positio
         (DB rows the broker no longer shows, closed), and
         send_reconcile_unavailable_alert() (broker read failed/empty — fell back
         to DB-only recovery, closed nothing).
+v1.6 — 2026-07-07 — send_short_leg_closed_alert(): loud alarm when an intraday
+        broker check finds a SHORT leg auto-closed by the broker while the long
+        remains — protection removed, now managing the long on its own.
 """
 
 import logging
@@ -165,6 +168,17 @@ class AlertManager:
             f"\u26A0\uFE0F Broker reconcile unavailable{why} | {instrument} | "
             f"DB-only recovery, no positions closed | verify manually | "
             f"{fmt_et_short()}"
+        )
+
+    def send_short_leg_closed_alert(self, instrument: str,
+                                    closed_desc: str, surviving: str):
+        """An intraday broker check found a SHORT leg auto-closed by the broker
+        while the long remains — the defined-risk structure is broken and the
+        protection is gone. Loud on purpose."""
+        self._send(
+            f"\U0001F6A8 SHORT LEG CLOSED BY BROKER | {instrument} | "
+            f"{closed_desc} | short gone, now holding: {surviving} | "
+            f"protection removed — managing the long on its own | {fmt_et_short()}"
         )
 
     # ── 2. Bot stopped ──────────────────────────────────────────────────────
