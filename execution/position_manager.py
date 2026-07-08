@@ -27,6 +27,9 @@ v1.9 — 2026-07-07 — flatten_all(): durable, complete forced close for the 15
         booked — replacing main.py's old direct place_exit_order() that submitted
         an order but never wrote status='closed'. Returns trade_ids that failed
         to close so the caller can retry/escalate.
+v2.0 — 2026-07-07 — _execute_exit P&L is now credit-signed for an adopted SHORT
+        (is_short_position), not just condor legs — so flatten_all/normal exits
+        book a broker-adopted short's realized P&L with the correct sign.
 """
 
 import logging
@@ -283,11 +286,13 @@ class PositionManager:
 
         entry_prem    = record["entry_premium"]
         contracts     = record["contracts"]
-        # Credit spreads (condor legs) profit when the spread value FALLS, so the
-        # P&L sign is inverted vs a debit trade.
-        is_condor_leg = (bool(record.get("is_condor_leg"))
-                         or record.get("strategy") == "IronCondorStrategy")
-        if is_condor_leg:
+        # Credit/short positions profit when the premium FALLS, so the P&L sign
+        # is inverted vs a debit (long) trade. This covers condor legs AND an
+        # adopted short leg (is_short_position) discovered at the broker.
+        credit_signed = (bool(record.get("is_condor_leg"))
+                         or record.get("strategy") == "IronCondorStrategy"
+                         or bool(record.get("is_short_position")))
+        if credit_signed:
             pnl_per_share = entry_prem - current_premium
         else:
             pnl_per_share = current_premium - entry_prem
