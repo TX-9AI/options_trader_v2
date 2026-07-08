@@ -31,6 +31,12 @@ v2.12 — 2026-07-07 — LIVE broker reconciliation wired into recovery: the bro
         and closes PHANTOM DB rows the broker no longer shows. FAIL-SAFE: a
         failed or empty broker read never closes anything — falls back to
         DB-only recovery. Paper is unchanged (no broker query).
+v2.13 — 2026-07-07 — INTRADAY broker reconcile (LIVE + enabled): every 30 min
+        across RTH with the last sweep at 15:30, a leg-role-aware check catches
+        positions the broker closed mid-session — especially a SHORT leg
+        auto-closed while the long remains (loud alarm, close the broken record,
+        adopt the surviving long so the 15:45 flatten handles it cleanly). Only
+        inspects rows we already manage; fail-safe on a bad/empty read.
 v2.9 — 2026-07-02 — block new entries when the daily loss halt is active
         (day P&L <= -DAILY_LOSS_LIMIT_USD); open positions still exit.
 v2.8 — 2026-07-02 — (2a) ORB-window sweep override: when an ORB signal fires but
@@ -64,7 +70,7 @@ import signal
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -153,6 +159,7 @@ class BotState:
         self.orb_reset_done:   bool = False     # ORB reset once per session
         self.orb_range_established_today: bool = False  # today's ORB range ESTABLISHED
         self.hard_close_alerted: bool = False   # alerted once on a failed 15:45 flatten
+        self.last_reconcile_slot: Optional[str] = None  # last intraday broker-reconcile slot done
 
 
 def run_analysis(state: BotState) -> dict:
@@ -670,6 +677,18 @@ def main_loop(state: BotState):
             # ── RTH session reset ──────────────────────────────────────────
             handle_session_reset(state)
 
+            # ── Intraday broker reconcile (LIVE + enabled) ─────────────────
+            # Every 30 min across RTH, last sweep at 15:30 — catches a broker-
+            # side leg closure (e.g. shorts auto-closed) before the 15:45
+            # flatten acts. Fires once per slot; fail-safe on a bad/empty read.
+            if not state.paper_trading and BROKER_RECONCILE_ENABLED:
+                slot = _intraday_reconcile_slot(now_et())
+                if slot and slot != state.last_reconcile_slot:
+                    state.last_reconcile_slot = slot
+                    _intraday_reconcile(
+                        state, os.environ.get("OT_INSTRUMENT", INSTRUMENT)
+                    )
+
             # ── Hard close check ──────────────────────────────────────────
             if is_hard_close_time():
                 handle_hard_close(state)
@@ -806,6 +825,103 @@ def _describe_position(record: dict) -> str:
         return (f"CONDOR {side} "
                 f"{record.get('short_strike',0):.0f}/{record.get('long_strike',0):.0f}")
     return f"{side} {record.get('strike',0):.0f}"
+
+
+def _intraday_reconcile_slot(now):
+    """30-minute RTH reconcile slot key, or None outside the window. Slots at
+    :00 and :30 from 09:30 to 15:30 (last = 15:30, 15 min before the 15:45
+    flatten). A slot stays 'current' until 15:45, so a late tick still catches
+    the final 15:30 sweep; nothing fires after that (the flatten takes over)."""
+    if now.weekday() >= 5:
+        return None
+    t = now.time()
+    if t < dtime(9, 30) or t >= dtime(15, 45):
+        return None
+    boundary = 0 if now.minute < 30 else 30
+    hh, mm = now.hour, boundary
+    if (hh, mm) > (15, 30):      # cap the last slot at 15:30
+        hh, mm = 15, 30
+    return f"{now:%Y-%m-%d} {hh:02d}:{mm:02d}"
+
+
+def _intraday_reconcile(state: BotState, instrument: str):
+    """
+    LIVE intraday broker-truth check (gated by BROKER_RECONCILE_ENABLED). Detects
+    positions the broker closed out from under us DURING the session — especially
+    a SHORT leg auto-closed while the long remains — and reacts before the 15:45
+    flatten. It only inspects rows WE already manage (it does not adopt brand-new
+    broker positions intraday, so a manual trade you place is left alone).
+
+    FAIL-SAFE: a failed or empty broker read changes nothing.
+    """
+    trade_logger = get_trade_logger()
+    try:
+        from data.tasty_client import get_open_option_positions
+        broker = get_open_option_positions()
+    except Exception as e:
+        logger.error(f"Intraday reconcile: broker read failed ({e}) — no action.")
+        return
+
+    open_rows = trade_logger.get_open_trades_live()
+    if not open_rows:
+        return
+    if not broker:
+        logger.warning(
+            "Intraday reconcile: broker empty while DB shows open rows — "
+            "inconclusive, no action (fail-safe)."
+        )
+        get_alert_manager().send_reconcile_unavailable_alert(instrument, "empty read (intraday)")
+        return
+
+    from execution.broker_reconcile import leg_roles, _adopt_record
+    broker_by_sym = {p["symbol"]: p for p in broker if p.get("symbol")}
+    broker_syms   = set(broker_by_sym)
+
+    changed  = False
+    phantoms = []
+    for rec in open_rows:
+        rid = rec.get("trade_id", "")
+        short_syms, long_syms = leg_roles(rec)
+        all_syms = short_syms | long_syms
+        if not all_syms:
+            continue
+
+        # whole position gone at the broker -> phantom
+        if not (all_syms & broker_syms):
+            trade_logger.close_phantom(rid, reason="phantom_intraday")
+            phantoms.append(rid)
+            changed = True
+            continue
+
+        # SHORT gone while a LONG remains -> broker closed our protection
+        short_present = bool(short_syms & broker_syms)
+        long_present  = bool(long_syms & broker_syms)
+        if short_syms and not short_present and long_present:
+            trade_logger.close_phantom(rid, reason="short_closed_by_broker")
+            surviving = []
+            for sym in (long_syms & broker_syms):
+                adopted = _adopt_record(broker_by_sym[sym])
+                if adopted:
+                    trade_logger.log_entry(adopted)
+                    surviving.append(_describe_position(adopted))
+            changed = True
+            get_alert_manager().send_short_leg_closed_alert(
+                instrument  = instrument,
+                closed_desc = _describe_position(rec),
+                surviving   = ", ".join(surviving) or "(long leg)",
+            )
+            logger.error(
+                f"SHORT LEG CLOSED BY BROKER [{instrument}] {_describe_position(rec)} "
+                f"-> adopted surviving long(s): {surviving}"
+            )
+
+    if phantoms:
+        get_alert_manager().send_phantom_closed_alert(instrument, phantoms)
+    if changed:
+        # re-sync in-memory management to the corrected DB truth
+        get_position_manager(state.paper_trading).set_open_positions(
+            trade_logger.get_open_trades_live()
+        )
 
 
 def _reconcile_with_broker(state: BotState, live_rows: list,
