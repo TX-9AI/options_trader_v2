@@ -3,6 +3,19 @@ analysis/regime_classifier.py — Market regime classification.
 Ported from crypto_trader v4.2. BtcPersonality removed (equities context).
 Added ORB_CONFIRMED as a regime that overlays TRENDING when ORB is confirmed.
 
+v1.2 — 2026-07-09 — base-regime definitions corrected + honest abstention.
+        (a) RANGING now has POSITIVE conditions (_is_ranging: low ADX, price
+            contained INSIDE the bands, not expanding) instead of being the
+            silent catch-all "everything else" bucket.
+        (b) UNKNOWN is now the TRUE fallback when nothing matches — the
+            classifier abstains instead of forcing a RANGING label. UNKNOWN is a
+            hard NO-TRADE regime, gated in the strategy dispatch (main.py): when
+            regime is UNKNOWN/undefined, NO strategy may fire.
+        (c) TRENDING now uses the previously-DEAD `structure` argument: a trend
+            must not have CONTRADICTING structure (no LH_LL in a bull, no HH_HL
+            in a bear). ADX + alignment established strength; structure confirms
+            it's an actual trend and not a structureless spike.
+        Definitional (fix-on-principle), not calibration.
 v1.1 — 2026-07-08 — SWEEP DEFINITION CORRECTED (location + rejection). A sweep
         is not "a wick past a level." By definition it requires THREE things:
         (1) LOCATION — price at a MAPPED liquidity zone (named pool: PDH/PDL/
@@ -158,9 +171,21 @@ class RegimeClassifier:
             )
             return self._finalize(state)
 
-        state.primary_regime = Regime.RANGING
-        state.conviction     = self._ranging_conviction(trend_state, vol_state)
-        state.notes          = f"ADX={trend_state.primary_adx:.1f} oscillating"
+        if self._is_ranging(vol_state, trend_state):
+            state.primary_regime = Regime.RANGING
+            state.conviction     = self._ranging_conviction(trend_state, vol_state)
+            state.notes          = f"ADX={trend_state.primary_adx:.1f}, contained inside bands"
+            return self._finalize(state)
+
+        # TRUE fallback: nothing matched cleanly. ABSTAIN — do not force a label.
+        # UNKNOWN is a hard NO-TRADE regime (gated in the strategy dispatch); an
+        # unclassified tape is not a tradeable edge, so standing aside is correct.
+        state.primary_regime = Regime.UNKNOWN
+        state.conviction     = 0.0
+        state.notes          = (
+            f"unclassified — ADX={trend_state.primary_adx:.1f}, "
+            f"bb={vol_state.price_vs_bb}, expanding={vol_state.is_expanding} — NO TRADE"
+        )
         return self._finalize(state)
 
     def _is_sweep_reversal(self, liq_map, vol_state, trend_state) -> bool:
@@ -221,6 +246,28 @@ class RegimeClassifier:
             return False
         if trend_state.aligned_timeframes < 2:
             return False
+        # STRUCTURE confirmation (v1.2): ADX + alignment prove strength, but a
+        # trend must not carry CONTRADICTING structure — a bull with LH_LL or a
+        # bear with HH_HL is a structureless spike, not a trend. (Neutral/absent
+        # structure is allowed to pass on ADX+alignment; tightening to an exact
+        # match is a calibration option once sessions accumulate.)
+        contra = "LH_LL" if trend_state.is_bullish else "HH_HL"
+        if structure.structure_sequence == contra:
+            return False
+        return True
+
+    def _is_ranging(self, vol_state, trend_state) -> bool:
+        """A range has POSITIVE conditions (v1.2), it is not 'everything else':
+        no trend strength (ADX below the range threshold), price CONTAINED inside
+        the Bollinger envelope, and volatility not expanding. If these do not
+        hold and nothing else matched, the regime is UNKNOWN (abstain), not a
+        forced RANGING label."""
+        if trend_state.primary_adx >= ADX_RANGE_THRESHOLD:
+            return False                       # too much directional strength for a range
+        if vol_state.is_expanding:
+            return False                       # expansion is not ranging
+        if vol_state.price_vs_bb != "INSIDE":
+            return False                       # price outside the envelope isn't contained
         return True
 
     def _sweep_conviction(self, liq_map, trend_state) -> float:
