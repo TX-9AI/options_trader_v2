@@ -27,6 +27,11 @@ v1.9 — 2026-07-07 — flatten_all(): durable, complete forced close for the 15
         booked — replacing main.py's old direct place_exit_order() that submitted
         an order but never wrote status='closed'. Returns trade_ids that failed
         to close so the caller can retry/escalate.
+v2.1 — 2026-07-09 — _fetch_current_premium PAPER fallback fixed: on a chain miss
+        it returned the ENTRY premium, so any exit taken during a chain gap booked
+        exit==entry (P&L=$0) — a real loss recorded as a scratch, and the exit
+        logic blinded to the true premium. Now returns the LAST-KNOWN mark
+        (update_current_premium), surrendering to entry only if never priced.
 v2.0 — 2026-07-07 — _execute_exit P&L is now credit-signed for an adopted SHORT
         (is_short_position), not just condor legs — so flatten_all/normal exits
         book a broker-adopted short's realized P&L with the correct sign.
@@ -232,6 +237,22 @@ class PositionManager:
                 pass
 
         if self.paper_trading:
+            # LAST-KNOWN MARK, not entry (v2.1). Falling back to entry premium
+            # here fabricated a $0 P&L on ANY exit taken while the chain was
+            # momentarily unavailable — a real -$818 loss was booked as breakeven
+            # at the 15:45 hard close (CRM 2026-07-09, exit recorded == entry).
+            # It also blinded the exit logic (a position that "looks like entry"
+            # can't trip a stop/target/trail). Use the last live mark that was
+            # stored via update_current_premium every good tick; only surrender to
+            # entry if we have literally never priced it, and log it so it's never
+            # silent.
+            last_mark = record.get("current_premium") or 0.0
+            if last_mark > 0:
+                return last_mark
+            logger.warning(
+                f"{str(record.get('trade_id',''))[:8]}: no chain and no prior "
+                f"mark — falling back to entry premium (P&L may be understated)"
+            )
             return record.get("entry_premium", 0.0)
 
         client = get_client()
