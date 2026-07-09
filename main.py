@@ -448,6 +448,17 @@ def attempt_new_entry(ctx: dict, regime: RegimeState, state: BotState):
     macro = ctx["macro"]
     signal = None
 
+    # ── HARD GATE: UNKNOWN / undefined regime ⇒ NO TRADE, full stop. ───────────
+    # Memoryless pass-through of the classifier's verdict — it adds ZERO latency
+    # and holds NO state. It does not debounce, confirm, or wait: the instant
+    # classify() returns a real regime, this passes on the SAME tick, so a
+    # UNKNOWN→BREAKOUT transition fires the entry immediately (no late entries).
+    # It only blocks when the tape is genuinely unclassified. Leaving UNKNOWN is
+    # gated solely by the regime definitions becoming true, never by this gate.
+    if regime is None or getattr(regime, "primary_regime", None) in (Regime.UNKNOWN, None, ""):
+        logger.info("STRATEGY: NO TRADE — regime UNKNOWN/undefined (hard gate)")
+        return
+
     # ── Strategy dispatch: regime → strategy ──────────────────────────────────
     # Priority 1: ORB — only when the engine has a CONFIRMED break+retest.
     # Note: the engine defers OPEN when regime==SWEEP_REVERSAL (sweeps take
@@ -698,18 +709,17 @@ def main_loop(state: BotState):
             # ── Main analysis ─────────────────────────────────────────────
             ctx = run_analysis(state)
 
-            # ── Regime reassessment ───────────────────────────────────────
-            should_reassess = (
-                state.last_regime_at is None or
-                minutes_since(state.last_regime_at) >= REGIME_REASSESS_MINUTES
-            )
-            # Session loss limit forces an off-schedule reassessment (no halt).
+            # ── Regime reassessment — EVERY TICK ──────────────────────────
+            # "Regime aware" means aware now, not eventually. Classification is
+            # cheap (threshold checks over the ctx run_analysis already computed),
+            # so we reclassify every tick — no throttle. Verified safe: the only
+            # stateful consumer of regime is exit_engine's regime-flip exits
+            # (butterfly/condor), which are event-driven and WANT to fire the
+            # instant a regime flips. A loss-limit request still forces its own
+            # off-schedule reassessment tag for the logs.
             loss_reassess = get_risk_manager().consume_reassess_request()
-            if should_reassess or loss_reassess:
-                trigger = "loss_limit" if loss_reassess else "scheduled"
-                regime = run_regime_classification(ctx, trigger, state)
-            else:
-                regime = state.current_regime
+            trigger = "loss_limit" if loss_reassess else "scheduled"
+            regime = run_regime_classification(ctx, trigger, state)
 
             if regime is None:
                 time.sleep(POLL_INTERVAL_SECONDS)
