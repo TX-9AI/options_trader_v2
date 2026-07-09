@@ -2,6 +2,9 @@
 query.py — OptionsTrader Performance Dashboard
 v1.0 — original
 v1.1 — 2026-06-29 — Fix: read INSTRUMENT from systemd env via get_runtime_env()
+v1.2 — 2026-07-09 — W/L consistency: a $0 (scratch) trade is no longer counted
+        as a loss (was pnl<=0), matching status.py (pnl<0). Reconciles the
+        0W/0L vs 0W/1L mismatch between the two tools on breakeven trades.
                      config.py fallback is QQQ but live bot may be configured for SPX
 Options-specific: strikes, premiums, delta, P&L, butterfly legs, session stats.
 """
@@ -251,7 +254,7 @@ def show_today(conn):
         return
 
     wins      = [r for r in rows if (r["pnl_usd"] or 0) > 0]
-    losses    = [r for r in rows if (r["pnl_usd"] or 0) <= 0]
+    losses    = [r for r in rows if (r["pnl_usd"] or 0) < 0]   # v1.2: strict; $0 is a scratch, not a loss (match status.py)
     total_pnl = sum(r["pnl_usd"] or 0 for r in rows)
     win_rate  = len(wins) / len(rows) * 100 if rows else 0
     total_cost= sum(r["total_cost"] or 0 for r in rows)
