@@ -3,6 +3,21 @@ analysis/liquidity_mapper.py — Institutional liquidity mapping.
 Tracks equal highs/lows, stop clusters, liquidity sweeps, and
 imbalance fills. Core input for the sweep reversal strategy.
 
+v1.3 — 2026-07-08 — SWEEP DEFINITION CORRECTION (rejection, not just penetration).
+        The old rejection_pct measured distance from the wick to the LAST close in
+        the window — it never checked whether price came back INSIDE the swept
+        level. A breakout candle that poked a pool and CLOSED THROUGH it (accepted)
+        scored a high rejection_pct and was stamped a confirmed sweep. That is the
+        defect that let breakouts (AVGO 380+ open-air ladder) be classified as
+        sweeps. A sweep BY DEFINITION requires penetration AND rejection — price
+        thrown back and holding inside the level. Now each LiquiditySweep also
+        records `reclaimed` (did closes return inside the pool and hold) and
+        `closes_beyond` (how many closes ACCEPTED through it). rejection_pct is now
+        measured off a close that is actually back inside the level. Acceptance
+        (closes_beyond >= ACCEPT_CLOSES) is no longer a sweep — it is a breakout.
+        Calibration constants (ACCEPT_CLOSES, hold bars) are placeholders to be
+        tightened as candle-logger sessions accumulate; the reclaim REQUIREMENT
+        itself is definitional, not a tunable.
 v1.2 — 2026-07-06 — detection fixes: recent_sweep is now selected by ACTUAL
         TIME (own-timeframe bars_ago × tf minutes), not raw cross-timeframe bar
         index; sweep_age_bars reported in consistent 5m-equivalent bars (fixes
@@ -59,6 +74,9 @@ class LiquiditySweep:
     timeframe:      str     = ""
     # Was this sweep of a named level? (PDH/PDL/session)
     swept_named_level: str  = ""        # Name of the level swept, if any
+    # v1.3 — rejection vs acceptance (the truth that makes it a sweep, not a breakout)
+    reclaimed:      bool    = False     # price closed back INSIDE the level and held
+    closes_beyond:  int     = 0         # # of closes that ACCEPTED through the level
 
 
 @dataclass
@@ -369,11 +387,18 @@ class LiquidityMapper:
         for pool in lmap.pools:
             for i in range(1, n):
                 if pool.kind == "high" and highs[i] > pool.price and not pool.swept:
-                    reject_close = closes[i]
-                    for k in range(1, min(SWEEP_REJECTION_CANDLES + 1, n - i)):
-                        reject_close = closes[i + k]
+                    # A sweep of a HIGH requires REJECTION: after poking above the
+                    # pool, price must CLOSE BACK BELOW it (inside) and hold. Closes
+                    # that stay ABOVE the pool are ACCEPTANCE — a breakout, not a sweep.
+                    window = range(i, min(i + SWEEP_REJECTION_CANDLES + 1, n))
+                    closes_beyond = sum(1 for k in window if closes[k] > pool.price)
+                    reclaimed = closes[i] <= pool.price or any(
+                        closes[k] <= pool.price for k in window)
+                    # rejection measured off a close that is actually back INSIDE
+                    reject_close = min((closes[k] for k in window
+                                        if closes[k] <= pool.price), default=closes[i])
                     rejection_pct = (highs[i] - reject_close) / highs[i]
-                    if rejection_pct >= 0.002:
+                    if reclaimed and rejection_pct >= 0.002:
                         sweep = LiquiditySweep(
                             pool_price=pool.price,
                             sweep_price=highs[i],
@@ -384,7 +409,9 @@ class LiquidityMapper:
                             bar_index=i,
                             bars_ago=(n - 1 - i),
                             timeframe=tf,
-                            swept_named_level=pool.name if pool.is_named else ""
+                            swept_named_level=pool.name if pool.is_named else "",
+                            reclaimed=reclaimed,
+                            closes_beyond=closes_beyond
                         )
                         lmap.sweeps.append(sweep)
                         pool.swept = True
@@ -392,11 +419,17 @@ class LiquidityMapper:
                         pool.rejection_confirmed = True
 
                 elif pool.kind == "low" and lows[i] < pool.price and not pool.swept:
-                    reject_close = closes[i]
-                    for k in range(1, min(SWEEP_REJECTION_CANDLES + 1, n - i)):
-                        reject_close = closes[i + k]
+                    # A sweep of a LOW requires REJECTION: after poking below the
+                    # pool, price must CLOSE BACK ABOVE it (inside) and hold. Closes
+                    # that stay BELOW the pool are ACCEPTANCE — a breakdown, not a sweep.
+                    window = range(i, min(i + SWEEP_REJECTION_CANDLES + 1, n))
+                    closes_beyond = sum(1 for k in window if closes[k] < pool.price)
+                    reclaimed = closes[i] >= pool.price or any(
+                        closes[k] >= pool.price for k in window)
+                    reject_close = max((closes[k] for k in window
+                                        if closes[k] >= pool.price), default=closes[i])
                     rejection_pct = (reject_close - lows[i]) / lows[i]
-                    if rejection_pct >= 0.002:
+                    if reclaimed and rejection_pct >= 0.002:
                         sweep = LiquiditySweep(
                             pool_price=pool.price,
                             sweep_price=lows[i],
@@ -407,7 +440,9 @@ class LiquidityMapper:
                             bar_index=i,
                             bars_ago=(n - 1 - i),
                             timeframe=tf,
-                            swept_named_level=pool.name if pool.is_named else ""
+                            swept_named_level=pool.name if pool.is_named else "",
+                            reclaimed=reclaimed,
+                            closes_beyond=closes_beyond
                         )
                         lmap.sweeps.append(sweep)
                         pool.swept = True

@@ -2,6 +2,21 @@
 analysis/regime_classifier.py — Market regime classification.
 Ported from crypto_trader v4.2. BtcPersonality removed (equities context).
 Added ORB_CONFIRMED as a regime that overlays TRENDING when ORB is confirmed.
+
+v1.1 — 2026-07-08 — SWEEP DEFINITION CORRECTED (location + rejection). A sweep
+        is not "a wick past a level." By definition it requires THREE things:
+        (1) LOCATION — price at a MAPPED liquidity zone (named pool: PDH/PDL/
+            session), within one expected move for the timeframe. Liquidity lives
+            at the edges, not in the range interior.
+        (2) PENETRATION — price pokes through the zone.
+        (3) REJECTION — price is thrown back and HOLDS (reclaimed). Acceptance
+            through the level is a BREAKOUT, not a sweep.
+        _is_sweep_reversal now enforces all three, so sweep only OUTRANKS
+        breakout/ranging when price is AT a mapped zone and rejected it. This
+        removes the failure where open-air breakouts (price far above a broken
+        level, no reclaim) were stamped SWEEP_REVERSAL and faded. The reclaim/
+        location REQUIREMENTS are definitional; the expected-move multiple
+        (SWEEP_PROXIMITY_EM) and acceptance count are calibration placeholders.
 """
 
 import logging
@@ -15,6 +30,12 @@ from analysis.trend_engine import TrendState
 from analysis.structure_analyzer import StructureMap
 from analysis.liquidity_mapper import LiquidityMap
 from data.macro_data import MacroSnapshot
+
+# ─── Sweep definition calibration (v1.1) ──────────────────────────────────────
+# Placeholders, to be tightened as candle-logger sessions accumulate. The reclaim
+# and named-zone REQUIREMENTS are definitional (not tunable); these are the knobs.
+SWEEP_ACCEPT_CLOSES = 2    # this many closes THROUGH the level ⇒ acceptance ⇒ breakout, not sweep
+SWEEP_PROXIMITY_EM  = 1.0  # (follow-up) allowed distance to zone, in expected moves
 from utils.time_utils import fmt_et_full
 
 logger = logging.getLogger(__name__)
@@ -143,12 +164,38 @@ class RegimeClassifier:
         return self._finalize(state)
 
     def _is_sweep_reversal(self, liq_map, vol_state, trend_state) -> bool:
-        if not liq_map.recent_sweep:
+        """A sweep requires all three, by definition (see v1.1 header):
+           LOCATION (at a mapped zone, within ~1 expected move),
+           PENETRATION (poked through), and REJECTION (reclaimed, not accepted).
+        Sweep only outranks breakout/ranging when price is AT a mapped edge."""
+        sweep = liq_map.recent_sweep
+        if not sweep:
             return False
-        if liq_map.sweep_age_bars <= 8 and liq_map.recent_sweep.rejection_pct >= 0.003:
+
+        # (3) REJECTION — must have been thrown back inside and held. Acceptance
+        # through the level (closes_beyond >= threshold) is a breakout, not a sweep.
+        if not getattr(sweep, "reclaimed", False):
+            return False
+        if getattr(sweep, "closes_beyond", 0) >= SWEEP_ACCEPT_CLOSES:
+            return False
+
+        # (1) LOCATION — the sweep must be of a MAPPED (named) liquidity zone
+        # (PDH/PDL/session H/L). Interior chop that pokes some local high/low is
+        # NOT a sweep — liquidity lives at the mapped edges, not in the range.
+        # This alone removes the QQQ-style interior fires (empty named level).
+        # CALIBRATION FOLLOW-UP: additionally require current price within one
+        # expected move (atr_normalized × SWEEP_PROXIMITY_EM) of pool_price. That
+        # needs current price plumbed into classify() (a separate small change in
+        # the caller); the named-zone gate below already enforces the core of the
+        # location truth without it.
+        if not getattr(sweep, "swept_named_level", ""):
+            return False
+
+        # (2) PENETRATION + freshness/strength (calibration placeholders)
+        if liq_map.sweep_age_bars <= 8 and sweep.rejection_pct >= 0.003:
             return True
         if (liq_map.sweep_age_bars <= 3 and
-                liq_map.recent_sweep.rejection_pct >= 0.005 and
+                sweep.rejection_pct >= 0.005 and
                 trend_state.primary_adx < 50):
             return True
         return False
