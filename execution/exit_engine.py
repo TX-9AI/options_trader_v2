@@ -35,6 +35,18 @@ v1.5 — 2026-07-07 — theta-bleed REWORK (merged onto the v1.4 adopted-positio
         corrected per-CALENDAR-day decay projection (v1.3/v1.4 divided by
         RTH_MINUTES=390, overstating projected decay ~3.7x). No call sites
         change; the adopted-position exit path (_evaluate_adopted) is untouched.
+v1.6 — 2026-07-09 — ORB UNCONDITIONAL -25% HARD FLOOR (critical risk fix). The
+        -25% dollar failsafe is universal by design and sweep/butterfly/adopted
+        all enforce it directly (if current_premium <= stop_prem). ORB was the
+        lone exception: it routed its floor through _update_trail, which returns
+        None below the +50% trail activation — so any ORB trade that never armed
+        the trail ran with NO dollar-loss stop and could bleed toward zero while
+        the structure stop held (CRM 2026-07-09: -83%, underlying still above the
+        range, trail never armed). _evaluate_orb now checks the floor DIRECTLY and
+        UNCONDITIONALLY right after the hard-close check, mirroring the other
+        three paths. _update_trail is unchanged (its de-arm is correct for the
+        TRAIL; the floor no longer depends on it). Known failure mode — the
+        adopted path's own comment already flagged _update_trail's de-arm.
 
 Exit triggers by strategy:
 
@@ -310,6 +322,23 @@ class ExitEngine:
         if is_hard_close_time():
             decision.should_exit = True
             decision.exit_reason = "hard_close_15:45_ET"
+            return decision
+
+        # 1b. HARD STOP — unconditional -25% dollar floor (v1.6). Mirrors the
+        #     sweep/butterfly/adopted paths, which check the floor DIRECTLY. ORB
+        #     previously relied on _update_trail for this, but that returns None
+        #     below the +50% trail activation — so a trade that never armed the
+        #     trail had NO floor and could bleed toward zero while the structure
+        #     stop held (CRM 2026-07-09: -83%). The floor must fire every tick,
+        #     regardless of trail state.
+        stop_prem = record.get("stop_premium", 0.0) or (entry_prem * 0.75)
+        if stop_prem > 0 and current_premium <= stop_prem:
+            decision.should_exit = True
+            decision.exit_reason = f"hard_stop_25pct pnl={pnl_pct:.1%}"
+            logger.info(
+                f"ORB HARD STOP: {trade_id[:8]} prem={current_premium:.2f} "
+                f"<= floor={stop_prem:.2f} (pnl={pnl_pct:.1%})"
+            )
             return decision
 
         # 2. RANGE VIOLATION \u2014 1-min candle closes back inside ORB range
