@@ -3,6 +3,21 @@ analysis/regime_classifier.py — Market regime classification.
 Ported from crypto_trader v4.2. BtcPersonality removed (equities context).
 Added ORB_CONFIRMED as a regime that overlays TRENDING when ORB is confirmed.
 
+v1.3 — 2026-07-09 — COVERAGE FIX: a strongly-trending tape must not fall to
+        UNKNOWN. Root cause (regime_log post-mortem, 2026-07-09): during clean,
+        held ORB breakouts at ADX 43–50, momentary timeframe de-alignment made
+        `aligned_timeframes < 2` kick the tick out of _is_trending; BREAKOUT
+        simultaneously failed on a BB re-entry flicker; nothing else matched →
+        UNKNOWN → no-trade gate → five high-beta names (AMD, MU, PLTR, AMZN,
+        NVDA*) fired ZERO trades on clean breakouts. (*NVDA was a deploy-timing
+        casualty, not a classifier miss.)
+        FIX: timeframe alignment is CORROBORATION for MARGINAL ADX, not a hard
+        gate at any strength. Below ADX_STRONG_SOLO, alignment ≥ 2 is still
+        required exactly as before; at/above it, ADX carries the trend on its
+        own. The structure-contradiction guard and NEUTRAL-direction rejection
+        are unchanged — this widens nothing except the alignment requirement
+        for tape that is unambiguously strong. Contained, definitional; the
+        persistence (conviction-integrator) redesign subsumes it later.
 v1.2 — 2026-07-09 — base-regime definitions corrected + honest abstention.
         (a) RANGING now has POSITIVE conditions (_is_ranging: low ADX, price
             contained INSIDE the bands, not expanding) instead of being the
@@ -49,6 +64,10 @@ from data.macro_data import MacroSnapshot
 # and named-zone REQUIREMENTS are definitional (not tunable); these are the knobs.
 SWEEP_ACCEPT_CLOSES = 2    # this many closes THROUGH the level ⇒ acceptance ⇒ breakout, not sweep
 SWEEP_PROXIMITY_EM  = 1.0  # (follow-up) allowed distance to zone, in expected moves
+# ─── Trend coverage calibration (v1.3) ────────────────────────────────────────
+ADX_STRONG_SOLO     = 35   # at/above this ADX, trend stands WITHOUT timeframe
+                           # alignment (alignment corroborates marginal ADX only);
+                           # calibration knob — refine from candle-logger base rates
 from utils.time_utils import fmt_et_full
 
 logger = logging.getLogger(__name__)
@@ -244,7 +263,12 @@ class RegimeClassifier:
             return False
         if trend_state.overall_direction == "NEUTRAL":
             return False
-        if trend_state.aligned_timeframes < 2:
+        # v1.3: alignment corroborates MARGINAL ADX; it is not a hard gate at
+        # any strength. At ADX ≥ ADX_STRONG_SOLO the tape is unambiguously
+        # strong and a momentary timeframe de-alignment must not drop a held
+        # trend to UNKNOWN (the BREAKOUT↔UNKNOWN 15s flip-flop of 2026-07-09).
+        if (trend_state.primary_adx < ADX_STRONG_SOLO and
+                trend_state.aligned_timeframes < 2):
             return False
         # STRUCTURE confirmation (v1.2): ADX + alignment prove strength, but a
         # trend must not carry CONTRADICTING structure — a bull with LH_LL or a
